@@ -3592,7 +3592,7 @@ impl Default for Config {
             config_path: zeroclaw_dir.join("config.toml"),
             api_key: None,
             api_url: None,
-            default_provider: Some("openrouter".to_string()),
+            default_provider: None,
             default_model: Some("anthropic/claude-sonnet-4.6".to_string()),
             model_providers: HashMap::new(),
             default_temperature: 0.7,
@@ -3646,6 +3646,10 @@ struct ActiveWorkspaceState {
 }
 
 fn default_config_dir() -> Result<PathBuf> {
+    if let Ok(path) = std::env::var("ZEROCLAW_CONFIG_DIR") {
+        return Ok(PathBuf::from(path));
+    }
+
     let home = UserDirs::new()
         .map(|u| u.home_dir().to_path_buf())
         .context("Could not find home directory")?;
@@ -4006,6 +4010,11 @@ fn read_codex_openai_api_key() -> Option<String> {
 }
 
 impl Config {
+    /// Returns true if the configuration has a default provider set.
+    pub fn is_configured(&self) -> bool {
+        self.default_provider.is_some()
+    }
+
     pub async fn load_or_init() -> Result<Self> {
         let (default_zeroclaw_dir, default_workspace_dir) = default_config_and_workspace_dirs()?;
 
@@ -5986,6 +5995,20 @@ channel_id = "C123"
             !c.gateway.allow_public_bind,
             "Config default must block public bind"
         );
+    }
+
+    #[test]
+    async fn config_default_provider_is_none() {
+        let c = Config::default();
+        assert!(c.default_provider.is_none(), "Default provider should be None to force onboarding");
+        assert!(!c.is_configured(), "is_configured() should be false by default");
+    }
+
+    #[test]
+    async fn config_is_configured_true_when_provider_set() {
+        let mut c = Config::default();
+        c.default_provider = Some("foo".to_string());
+        assert!(c.is_configured(), "is_configured() should be true when provider is set");
     }
 
     #[test]

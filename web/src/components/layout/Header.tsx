@@ -15,6 +15,7 @@ const routeTitles: Record<string, string> = {
   '/cost': 'nav.cost',
   '/logs': 'nav.logs',
   '/doctor': 'nav.doctor',
+  '/skill-market': 'nav.skill_market',
 };
 
 export default function Header() {
@@ -26,7 +27,7 @@ export default function Header() {
   const pageTitle = t(titleKey);
 
   const toggleLanguage = () => {
-    setAppLocale(locale === 'en' ? 'tr' : 'en');
+    setAppLocale(locale === 'en' ? 'zh' : 'en');
   };
 
   return (
@@ -42,7 +43,7 @@ export default function Header() {
           onClick={toggleLanguage}
           className="px-3 py-1 rounded-md text-sm font-medium border border-gray-600 text-gray-300 hover:bg-gray-700 hover:text-white transition-colors"
         >
-          {locale === 'en' ? 'EN' : 'TR'}
+          {locale === 'en' ? 'EN' : '中'}
         </button>
 
         {/* Logout */}

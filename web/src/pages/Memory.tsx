@@ -7,6 +7,7 @@ import {
   X,
   Filter,
 } from 'lucide-react';
+import { useTranslation } from 'react-i18next';
 import type { MemoryEntry } from '@/types/api';
 import { getMemory, storeMemory, deleteMemory } from '@/lib/api';
 
@@ -21,6 +22,7 @@ function formatDate(iso: string): string {
 }
 
 export default function Memory() {
+  const { t } = useTranslation();
   const [entries, setEntries] = useState<MemoryEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -60,7 +62,7 @@ export default function Memory() {
 
   const handleAdd = async () => {
     if (!formKey.trim() || !formContent.trim()) {
-      setFormError('Key and content are required.');
+      setFormError(t('memory.required_fields'));
       return;
     }
     setSubmitting(true);
@@ -77,7 +79,7 @@ export default function Memory() {
       setFormContent('');
       setFormCategory('');
     } catch (err: unknown) {
-      setFormError(err instanceof Error ? err.message : 'Failed to store memory');
+      setFormError(err instanceof Error ? err.message : t('memory.store_failed'));
     } finally {
       setSubmitting(false);
     }
@@ -88,7 +90,7 @@ export default function Memory() {
       await deleteMemory(key);
       setEntries((prev) => prev.filter((e) => e.key !== key));
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : 'Failed to delete memory');
+      setError(err instanceof Error ? err.message : t('memory.delete_failed'));
     } finally {
       setConfirmDelete(null);
     }
@@ -98,7 +100,7 @@ export default function Memory() {
     return (
       <div className="p-6">
         <div className="rounded-lg bg-red-900/30 border border-red-700 p-4 text-red-300">
-          Failed to load memory: {error}
+          {t('memory.load_failed')}: {error}
         </div>
       </div>
     );
@@ -111,7 +113,7 @@ export default function Memory() {
         <div className="flex items-center gap-2">
           <Brain className="h-5 w-5 text-blue-400" />
           <h2 className="text-base font-semibold text-white">
-            Memory ({entries.length})
+            {t('memory.title')} ({entries.length})
           </h2>
         </div>
         <button
@@ -119,7 +121,7 @@ export default function Memory() {
           className="flex items-center gap-2 bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium px-4 py-2 rounded-lg transition-colors"
         >
           <Plus className="h-4 w-4" />
-          Add Memory
+          {t('memory.add')}
         </button>
       </div>
 
@@ -132,7 +134,7 @@ export default function Memory() {
             value={search}
             onChange={(e) => setSearch(e.target.value)}
             onKeyDown={handleKeyDown}
-            placeholder="Search memory entries..."
+            placeholder={t('memory.search')}
             className="w-full bg-gray-900 border border-gray-700 rounded-lg pl-10 pr-4 py-2.5 text-sm text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500"
           />
         </div>
@@ -143,7 +145,7 @@ export default function Memory() {
             onChange={(e) => setCategoryFilter(e.target.value)}
             className="bg-gray-900 border border-gray-700 rounded-lg pl-10 pr-8 py-2.5 text-sm text-white appearance-none focus:outline-none focus:ring-2 focus:ring-blue-500 cursor-pointer"
           >
-            <option value="">All Categories</option>
+            <option value="">{t('memory.all_categories')}</option>
             {categories.map((cat) => (
               <option key={cat} value={cat}>
                 {cat}
@@ -155,7 +157,7 @@ export default function Memory() {
           onClick={handleSearch}
           className="px-4 py-2.5 bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium rounded-lg transition-colors"
         >
-          Search
+          {t('common.search')}
         </button>
       </div>
 
@@ -171,7 +173,7 @@ export default function Memory() {
         <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50">
           <div className="bg-gray-900 border border-gray-700 rounded-xl p-6 w-full max-w-md mx-4">
             <div className="flex items-center justify-between mb-4">
-              <h3 className="text-lg font-semibold text-white">Add Memory</h3>
+              <h3 className="text-lg font-semibold text-white">{t('memory.add')}</h3>
               <button
                 onClick={() => {
                   setShowForm(false);
@@ -192,37 +194,37 @@ export default function Memory() {
             <div className="space-y-4">
               <div>
                 <label className="block text-sm font-medium text-gray-300 mb-1">
-                  Key <span className="text-red-400">*</span>
+                  {t('memory.key')} <span className="text-red-400">*</span>
                 </label>
                 <input
                   type="text"
                   value={formKey}
                   onChange={(e) => setFormKey(e.target.value)}
-                  placeholder="e.g. user_preferences"
+                  placeholder={t('memory.key_placeholder')}
                   className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500"
                 />
               </div>
               <div>
                 <label className="block text-sm font-medium text-gray-300 mb-1">
-                  Content <span className="text-red-400">*</span>
+                  {t('memory.content')} <span className="text-red-400">*</span>
                 </label>
                 <textarea
                   value={formContent}
                   onChange={(e) => setFormContent(e.target.value)}
-                  placeholder="Memory content..."
+                  placeholder={t('memory.content_placeholder')}
                   rows={4}
                   className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500 resize-none"
                 />
               </div>
               <div>
                 <label className="block text-sm font-medium text-gray-300 mb-1">
-                  Category (optional)
+                  {t('memory.category_optional')}
                 </label>
                 <input
                   type="text"
                   value={formCategory}
                   onChange={(e) => setFormCategory(e.target.value)}
-                  placeholder="e.g. preferences, context, facts"
+                  placeholder={t('memory.category_placeholder')}
                   className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500"
                 />
               </div>
@@ -236,14 +238,14 @@ export default function Memory() {
                 }}
                 className="px-4 py-2 text-sm font-medium text-gray-300 hover:text-white border border-gray-700 rounded-lg hover:bg-gray-800 transition-colors"
               >
-                Cancel
+                {t('common.cancel')}
               </button>
               <button
                 onClick={handleAdd}
                 disabled={submitting}
                 className="px-4 py-2 text-sm font-medium text-white bg-blue-600 hover:bg-blue-700 rounded-lg transition-colors disabled:opacity-50"
               >
-                {submitting ? 'Saving...' : 'Save'}
+                {submitting ? t('memory.saving') : t('common.save')}
               </button>
             </div>
           </div>
@@ -258,7 +260,7 @@ export default function Memory() {
       ) : entries.length === 0 ? (
         <div className="bg-gray-900 rounded-xl border border-gray-800 p-8 text-center">
           <Brain className="h-10 w-10 text-gray-600 mx-auto mb-3" />
-          <p className="text-gray-400">No memory entries found.</p>
+          <p className="text-gray-400">{t('memory.empty')}</p>
         </div>
       ) : (
         <div className="bg-gray-900 rounded-xl border border-gray-800 overflow-x-auto">
@@ -266,19 +268,19 @@ export default function Memory() {
             <thead>
               <tr className="border-b border-gray-800">
                 <th className="text-left px-4 py-3 text-gray-400 font-medium">
-                  Key
+                  {t('memory.key')}
                 </th>
                 <th className="text-left px-4 py-3 text-gray-400 font-medium">
-                  Content
+                  {t('memory.content')}
                 </th>
                 <th className="text-left px-4 py-3 text-gray-400 font-medium">
-                  Category
+                  {t('memory.category')}
                 </th>
                 <th className="text-left px-4 py-3 text-gray-400 font-medium">
-                  Timestamp
+                  {t('memory.timestamp')}
                 </th>
                 <th className="text-right px-4 py-3 text-gray-400 font-medium">
-                  Actions
+                  {t('common.actions')}
                 </th>
               </tr>
             </thead>
@@ -307,18 +309,18 @@ export default function Memory() {
                   <td className="px-4 py-3 text-right">
                     {confirmDelete === entry.key ? (
                       <div className="flex items-center justify-end gap-2">
-                        <span className="text-xs text-red-400">Delete?</span>
+                        <span className="text-xs text-red-400">{t('memory.confirm_delete_short')}</span>
                         <button
                           onClick={() => handleDelete(entry.key)}
                           className="text-red-400 hover:text-red-300 text-xs font-medium"
                         >
-                          Yes
+                          {t('common.yes')}
                         </button>
                         <button
                           onClick={() => setConfirmDelete(null)}
                           className="text-gray-400 hover:text-white text-xs font-medium"
                         >
-                          No
+                          {t('common.no')}
                         </button>
                       </div>
                     ) : (

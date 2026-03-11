@@ -51,19 +51,28 @@ export function AuthProvider({ children }: AuthProviderProps) {
   useEffect(() => {
     if (checkAuth()) return; // already have a token, no need to check
     let cancelled = false;
-    getPublicHealth()
-      .then((health) => {
+
+    const checkHealth = async (retries = 10, delay = 500) => {
+      try {
+        const health = await getPublicHealth();
         if (cancelled) return;
         if (!health.require_pairing) {
           setAuthenticated(true);
         }
-      })
-      .catch(() => {
-        // health endpoint unreachable — fall back to showing pairing dialog
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false);
-      });
+        setLoading(false);
+      } catch (err) {
+        if (cancelled) return;
+        if (retries > 0) {
+          setTimeout(() => checkHealth(retries - 1, delay), delay);
+        } else {
+          // health endpoint unreachable — fall back to showing pairing dialog
+          setLoading(false);
+        }
+      }
+    };
+
+    checkHealth();
+
     return () => {
       cancelled = true;
     };

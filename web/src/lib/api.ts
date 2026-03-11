@@ -8,6 +8,10 @@ import type {
   CostSummary,
   CliTool,
   HealthSnapshot,
+  SkillSpec,
+  SkillInstallResult,
+  SkillAuditResult,
+  SkillMarketItem,
 } from '../types/api';
 import { clearToken, getToken, setToken } from './auth';
 
@@ -247,4 +251,129 @@ export function getCliTools(): Promise<CliTool[]> {
   return apiFetch<CliTool[] | { cli_tools: CliTool[] }>('/api/cli-tools').then((data) =>
     unwrapField(data, 'cli_tools'),
   );
+}
+
+export function getSkills(): Promise<SkillSpec[]> {
+  return apiFetch<SkillSpec[] | { skills: SkillSpec[] }>('/api/skills').then((data) =>
+    unwrapField(data, 'skills'),
+  );
+}
+
+export function installSkill(source: string): Promise<SkillInstallResult> {
+  return apiFetch<SkillInstallResult>('/api/skills', {
+    method: 'POST',
+    body: JSON.stringify({ source }),
+  });
+}
+
+export function auditSkill(source: string): Promise<SkillAuditResult> {
+  return apiFetch<SkillAuditResult>('/api/skills/audit', {
+    method: 'POST',
+    body: JSON.stringify({ source }),
+  });
+}
+
+export function removeSkill(name: string): Promise<void> {
+  return apiFetch<void>(`/api/skills/${encodeURIComponent(name)}`, {
+    method: 'DELETE',
+  });
+}
+
+export function getSkillMarket(): Promise<SkillMarketItem[]> {
+  return apiFetch<SkillMarketItem[] | { items: SkillMarketItem[] }>('/api/skills/market').then(
+    (data) => unwrapField(data, 'items'),
+  );
+}
+
+export function installSkillFromMarket(
+  marketId: string,
+  acknowledgeRisk: boolean,
+): Promise<SkillInstallResult> {
+  return apiFetch<SkillInstallResult>('/api/skills/market/install', {
+    method: 'POST',
+    body: JSON.stringify({ market_id: marketId, acknowledge_risk: acknowledgeRisk }),
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Onboarding
+// ---------------------------------------------------------------------------
+
+export async function getOnboardStatus(): Promise<{ configured: boolean }> {
+  const response = await fetch('/api/onboard');
+  if (!response.ok) {
+    throw new Error(`Onboard check failed (${response.status})`);
+  }
+  return response.json();
+}
+
+export interface OnboardInit {
+  tier: string;
+  provider: string;
+  api_key?: string;
+  api_url?: string;
+  model?: string;
+
+  // Project Context
+  user_name?: string;
+  timezone?: string;
+  agent_name?: string;
+  communication_style?: string;
+
+  // Memory
+  memory_backend: string;
+  memory_postgres_url?: string;
+  memory_qdrant_url?: string;
+  memory_qdrant_api_key?: string;
+  memory_auto_save?: boolean;
+
+  // Channels
+  telegram_token?: string;
+  telegram_allowed_users?: string;
+  discord_token?: string;
+  discord_guild_id?: string;
+  discord_allowed_users?: string; // Comma separated
+  channels_config?: Record<string, unknown>;
+
+  // Tunnel
+  enable_tunnel?: boolean;
+  tunnel_provider?: 'cloudflare' | 'ngrok' | 'tailscale' | 'custom';
+  tunnel_cloudflare_token?: string;
+  tunnel_ngrok_auth_token?: string;
+  tunnel_ngrok_domain?: string;
+  tunnel_tailscale_funnel?: boolean;
+  tunnel_custom_command?: string;
+
+  // Tool Mode
+  tool_mode?: 'sovereign' | 'composio';
+  composio_api_key?: string;
+  secrets_encrypt?: boolean;
+  autonomy_level?: 'read_only' | 'supervised' | 'full';
+
+  // Hardware
+  hardware_enabled?: boolean;
+  hardware_transport?: 'native' | 'serial' | 'probe' | 'none';
+  serial_port?: string;
+  baud_rate?: number;
+  probe_target?: string;
+  workspace_datasheets?: boolean;
+}
+
+export async function onboardInit(body: OnboardInit): Promise<void> {
+  let response: Response;
+  try {
+    response = await fetch('/api/onboard', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+  } catch (err: unknown) {
+    const detail = err instanceof Error ? err.message : 'unknown network error';
+    throw new Error(`Cannot reach local API /api/onboard: ${detail}`);
+  }
+
+  if (!response.ok) {
+    const text = await response.text().catch(() => '');
+    throw new Error(`Onboard failed (${response.status}): ${text}`);
+  }
 }

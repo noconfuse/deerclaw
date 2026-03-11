@@ -10,6 +10,7 @@ import {
   DollarSign,
   Activity,
   Stethoscope,
+  Store,
 } from 'lucide-react';
 import { t } from '@/lib/i18n';
 
@@ -24,6 +25,7 @@ const navItems = [
   { to: '/cost', icon: DollarSign, labelKey: 'nav.cost' },
   { to: '/logs', icon: Activity, labelKey: 'nav.logs' },
   { to: '/doctor', icon: Stethoscope, labelKey: 'nav.doctor' },
+  { to: '/skill-market', icon: Store, labelKey: 'nav.skill_market' },
 ];
 
 export default function Sidebar() {
@@ -32,10 +34,10 @@ export default function Sidebar() {
       {/* Logo / Title */}
       <div className="flex items-center gap-2 px-5 py-5 border-b border-gray-800">
         <div className="h-8 w-8 rounded-lg bg-blue-600 flex items-center justify-center text-white font-bold text-sm">
-          ZC
+          DC
         </div>
         <span className="text-lg font-semibold text-white tracking-wide">
-          ZeroClaw
+          DeerClaw
         </span>
       </div>
 

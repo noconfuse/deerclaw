@@ -669,6 +669,15 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/api/status", get(api::handle_api_status))
         .route("/api/config", get(api::handle_api_config_get))
         .route("/api/tools", get(api::handle_api_tools))
+        .route("/api/skills", get(api::handle_api_skills_list))
+        .route("/api/skills", post(api::handle_api_skills_install))
+        .route("/api/skills/audit", post(api::handle_api_skills_audit))
+        .route("/api/skills/{name}", delete(api::handle_api_skills_remove))
+        .route("/api/skills/market", get(api::handle_api_skills_market_list))
+        .route(
+            "/api/skills/market/install",
+            post(api::handle_api_skills_market_install),
+        )
         .route("/api/cron", get(api::handle_api_cron_list))
         .route("/api/cron", post(api::handle_api_cron_add))
         .route("/api/cron/{id}", delete(api::handle_api_cron_delete))
@@ -683,6 +692,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/api/cost", get(api::handle_api_cost))
         .route("/api/cli-tools", get(api::handle_api_cli_tools))
         .route("/api/health", get(api::handle_api_health))
+        .route("/api/onboard", get(api::handle_api_onboard_status))
+        .route("/api/onboard", post(api::handle_api_onboard_init))
         // ── SSE event stream ──
         .route("/api/events", get(sse::handle_sse_events))
         // ── WebSocket agent chat ──

@@ -7,16 +7,23 @@ import {
   Terminal,
   Package,
 } from 'lucide-react';
+import { useTranslation } from 'react-i18next';
 import type { ToolSpec, CliTool } from '@/types/api';
 import { getTools, getCliTools } from '@/lib/api';
 
 export default function Tools() {
+  const { t } = useTranslation();
   const [tools, setTools] = useState<ToolSpec[]>([]);
   const [cliTools, setCliTools] = useState<CliTool[]>([]);
   const [search, setSearch] = useState('');
   const [expandedTool, setExpandedTool] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+
+  const getToolDisplayName = (name: string) =>
+    t(`tools.meta.${name}.name`, { defaultValue: name });
+  const getToolDisplayDescription = (name: string, description: string) =>
+    t(`tools.meta.${name}.description`, { defaultValue: description });
 
   useEffect(() => {
     Promise.all([getTools(), getCliTools()])
@@ -30,6 +37,10 @@ export default function Tools() {
 
   const filtered = tools.filter(
     (t) =>
+      getToolDisplayName(t.name).toLowerCase().includes(search.toLowerCase()) ||
+      getToolDisplayDescription(t.name, t.description)
+        .toLowerCase()
+        .includes(search.toLowerCase()) ||
       t.name.toLowerCase().includes(search.toLowerCase()) ||
       t.description.toLowerCase().includes(search.toLowerCase()),
   );
@@ -44,7 +55,7 @@ export default function Tools() {
     return (
       <div className="p-6">
         <div className="rounded-lg bg-red-900/30 border border-red-700 p-4 text-red-300">
-          Failed to load tools: {error}
+          {t('tools.load_failed')}: {error}
         </div>
       </div>
     );
@@ -67,7 +78,7 @@ export default function Tools() {
           type="text"
           value={search}
           onChange={(e) => setSearch(e.target.value)}
-          placeholder="Search tools..."
+          placeholder={t('tools.search')}
           className="w-full bg-gray-900 border border-gray-700 rounded-lg pl-10 pr-4 py-2.5 text-sm text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
         />
       </div>
@@ -77,12 +88,12 @@ export default function Tools() {
         <div className="flex items-center gap-2 mb-4">
           <Wrench className="h-5 w-5 text-blue-400" />
           <h2 className="text-base font-semibold text-white">
-            Agent Tools ({filtered.length})
+            {t('tools.agent_tools')} ({filtered.length})
           </h2>
         </div>
 
         {filtered.length === 0 ? (
-          <p className="text-sm text-gray-500">No tools match your search.</p>
+          <p className="text-sm text-gray-500">{t('tools.no_match')}</p>
         ) : (
           <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
             {filtered.map((tool) => {
@@ -102,7 +113,7 @@ export default function Tools() {
                       <div className="flex items-center gap-2 min-w-0">
                         <Package className="h-4 w-4 text-blue-400 flex-shrink-0 mt-0.5" />
                         <h3 className="text-sm font-semibold text-white truncate">
-                          {tool.name}
+                          {getToolDisplayName(tool.name)}
                         </h3>
                       </div>
                       {isExpanded ? (
@@ -112,14 +123,14 @@ export default function Tools() {
                       )}
                     </div>
                     <p className="text-sm text-gray-400 mt-2 line-clamp-2">
-                      {tool.description}
+                      {getToolDisplayDescription(tool.name, tool.description)}
                     </p>
                   </button>
 
                   {isExpanded && tool.parameters && (
                     <div className="border-t border-gray-800 p-4">
                       <p className="text-xs text-gray-500 mb-2 font-medium uppercase tracking-wider">
-                        Parameter Schema
+                        {t('tools.parameter_schema')}
                       </p>
                       <pre className="text-xs text-gray-300 bg-gray-950 rounded-lg p-3 overflow-x-auto max-h-64 overflow-y-auto">
                         {JSON.stringify(tool.parameters, null, 2)}
@@ -139,7 +150,7 @@ export default function Tools() {
           <div className="flex items-center gap-2 mb-4">
             <Terminal className="h-5 w-5 text-green-400" />
             <h2 className="text-base font-semibold text-white">
-              CLI Tools ({filteredCli.length})
+              {t('tools.cli_tools')} ({filteredCli.length})
             </h2>
           </div>
 
@@ -148,16 +159,16 @@ export default function Tools() {
               <thead>
                 <tr className="border-b border-gray-800">
                   <th className="text-left px-4 py-3 text-gray-400 font-medium">
-                    Name
+                    {t('common.name')}
                   </th>
                   <th className="text-left px-4 py-3 text-gray-400 font-medium">
-                    Path
+                    {t('tools.path')}
                   </th>
                   <th className="text-left px-4 py-3 text-gray-400 font-medium">
-                    Version
+                    {t('tools.version')}
                   </th>
                   <th className="text-left px-4 py-3 text-gray-400 font-medium">
-                    Category
+                    {t('memory.category')}
                   </th>
                 </tr>
               </thead>
@@ -188,6 +199,7 @@ export default function Tools() {
           </div>
         </div>
       )}
+
     </div>
   );
 }

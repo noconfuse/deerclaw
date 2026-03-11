@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use directories::UserDirs;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime};
@@ -11,6 +12,16 @@ mod audit;
 const OPEN_SKILLS_REPO_URL: &str = "https://github.com/besoeasy/open-skills";
 const OPEN_SKILLS_SYNC_MARKER: &str = ".zeroclaw-open-skills-sync";
 const OPEN_SKILLS_SYNC_INTERVAL_SECS: u64 = 60 * 60 * 24 * 7;
+const DEFAULT_SKILL_MARKET_URL: &str =
+    "https://raw.githubusercontent.com/besoeasy/open-skills/main/market/catalog.json";
+const DEFAULT_CLAWHUB_MARKET_API_URL: &str = "https://clawhub.ai/api/v1/skills";
+const DEFAULT_CLAWHUB_MARKET_API_FALLBACK_URL: &str = "https://wry-manatee-359.convex.site/api/v1/skills";
+const DEFAULT_CLAWHUB_DOWNLOAD_API_URL: &str = "https://clawhub.ai/api/v1/download";
+const DEFAULT_CLAWHUB_DOWNLOAD_API_FALLBACK_URL: &str =
+    "https://wry-manatee-359.convex.site/api/v1/download";
+const DEFAULT_HTTP_USER_AGENT: &str = "zeroclaw-skill-market";
+const CLAWHUB_MARKET_PAGE_LIMIT: usize = 100;
+const CLAWHUB_MARKET_MAX_PAGES: usize = 8;
 
 /// A skill is a user-defined or community-built capability.
 /// Skills live in `~/.zeroclaw/workspace/skills/<name>/SKILL.md`
@@ -806,9 +817,10 @@ fn install_local_skill_source(source: &str, skills_path: &Path) -> Result<(PathB
 }
 
 fn install_git_skill_source(source: &str, skills_path: &Path) -> Result<(PathBuf, usize)> {
+    let (repo_source, sub_path) = split_git_source(source);
     let before = snapshot_skill_children(skills_path)?;
     let output = std::process::Command::new("git")
-        .args(["clone", "--depth", "1", source])
+        .args(["clone", "--depth", "1", repo_source])
         .current_dir(skills_path)
         .output()?;
     if !output.status.success() {
@@ -816,15 +828,581 @@ fn install_git_skill_source(source: &str, skills_path: &Path) -> Result<(PathBuf
         anyhow::bail!("Git clone failed: {stderr}");
     }
 
-    let installed_dir = detect_newly_installed_directory(skills_path, &before)?;
-    remove_git_metadata(&installed_dir)?;
-    match enforce_skill_security_audit(&installed_dir) {
-        Ok(report) => Ok((installed_dir, report.files_scanned)),
+    let cloned_dir = detect_newly_installed_directory(skills_path, &before)?;
+    remove_git_metadata(&cloned_dir)?;
+
+    if let Some(relative_sub_path) = sub_path {
+        let relative_sub_path = validate_relative_sub_path(relative_sub_path)?;
+        let selected_source = cloned_dir.join(&relative_sub_path);
+        if !selected_source.is_dir() {
+            let _ = std::fs::remove_dir_all(&cloned_dir);
+            anyhow::bail!(
+                "Skill sub-path not found in git source: {}",
+                relative_sub_path.display()
+            );
+        }
+
+        let selected_name = relative_sub_path
+            .file_name()
+            .context("Skill sub-path must point to a directory name")?;
+        let selected_dest = skills_path.join(selected_name);
+        if selected_dest.exists() {
+            let _ = std::fs::remove_dir_all(&cloned_dir);
+            anyhow::bail!(
+                "Destination skill already exists: {}",
+                selected_dest.display()
+            );
+        }
+
+        if let Err(err) = copy_dir_recursive_secure(&selected_source, &selected_dest) {
+            let _ = std::fs::remove_dir_all(&selected_dest);
+            let _ = std::fs::remove_dir_all(&cloned_dir);
+            return Err(err);
+        }
+
+        let report = match enforce_skill_security_audit(&selected_dest) {
+            Ok(report) => report,
+            Err(err) => {
+                let _ = std::fs::remove_dir_all(&selected_dest);
+                let _ = std::fs::remove_dir_all(&cloned_dir);
+                return Err(err);
+            }
+        };
+
+        let _ = std::fs::remove_dir_all(&cloned_dir);
+        return Ok((selected_dest, report.files_scanned));
+    }
+
+    match enforce_skill_security_audit(&cloned_dir) {
+        Ok(report) => Ok((cloned_dir, report.files_scanned)),
         Err(err) => {
-            let _ = std::fs::remove_dir_all(&installed_dir);
+            let _ = std::fs::remove_dir_all(&cloned_dir);
             Err(err)
         }
     }
+}
+
+fn parse_clawhub_slug(source: &str) -> Option<String> {
+    let raw = source.strip_prefix("clawhub://")?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let slug = raw
+        .split(['?', '#'])
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if slug.is_empty() { None } else { Some(slug) }
+}
+
+fn extract_clawhub_zip_secure(zip_bytes: &[u8], dest: &Path) -> Result<()> {
+    let mut archive = zip::ZipArchive::new(Cursor::new(zip_bytes))
+        .context("failed to read ClawHub skill archive")?;
+
+    for index in 0..archive.len() {
+        let mut entry = archive
+            .by_index(index)
+            .with_context(|| format!("failed to read archive entry #{index}"))?;
+        let entry_name = entry.name().to_string();
+        let relative_path = entry
+            .enclosed_name()
+            .map(|p| p.to_path_buf())
+            .with_context(|| format!("archive entry has unsafe path: {entry_name}"))?;
+        if relative_path.as_os_str().is_empty() {
+            continue;
+        }
+
+        if let Some(unix_mode) = entry.unix_mode() {
+            if (unix_mode & 0o170000) == 0o120000 {
+                anyhow::bail!("archive contains symlink entry: {entry_name}");
+            }
+        }
+
+        let out_path = dest.join(&relative_path);
+        if !out_path.starts_with(dest) {
+            anyhow::bail!("archive entry escapes destination: {entry_name}");
+        }
+
+        if entry.is_dir() {
+            std::fs::create_dir_all(&out_path)
+                .with_context(|| format!("failed to create directory {}", out_path.display()))?;
+            continue;
+        }
+
+        if let Some(parent) = out_path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create directory {}", parent.display()))?;
+        }
+        let mut out_file = std::fs::File::create(&out_path)
+            .with_context(|| format!("failed to create file {}", out_path.display()))?;
+        std::io::copy(&mut entry, &mut out_file)
+            .with_context(|| format!("failed to write file {}", out_path.display()))?;
+    }
+
+    Ok(())
+}
+
+fn install_clawhub_skill_source(source: &str, skills_path: &Path) -> Result<(PathBuf, usize)> {
+    let slug = parse_clawhub_slug(source)
+        .with_context(|| format!("invalid ClawHub source format: {source}"))?;
+    ensure_valid_skill_name(&slug)?;
+
+    let dest = skills_path.join(&slug);
+    if dest.exists() {
+        anyhow::bail!("Destination skill already exists: {}", dest.display());
+    }
+    std::fs::create_dir_all(&dest)
+        .with_context(|| format!("failed to create destination {}", dest.display()))?;
+
+    let custom_download_url = std::env::var("ZEROCLAW_CLAWHUB_DOWNLOAD_API_URL")
+        .ok()
+        .filter(|v| !v.trim().is_empty());
+    let download_urls: Vec<String> = if let Some(url) = custom_download_url {
+        vec![url]
+    } else {
+        vec![
+            DEFAULT_CLAWHUB_DOWNLOAD_API_URL.to_string(),
+            DEFAULT_CLAWHUB_DOWNLOAD_API_FALLBACK_URL.to_string(),
+        ]
+    };
+
+    let client = reqwest::blocking::Client::new();
+    let mut last_error: Option<anyhow::Error> = None;
+
+    for download_url in download_urls {
+        let response = match client
+            .get(&download_url)
+            .query(&[("slug", slug.as_str()), ("tag", "latest")])
+            .header(reqwest::header::USER_AGENT, DEFAULT_HTTP_USER_AGENT)
+            .header(reqwest::header::ACCEPT, "application/zip")
+            .send()
+        {
+            Ok(response) => response,
+            Err(err) => {
+                last_error = Some(anyhow::anyhow!(
+                    "failed to request ClawHub archive from {}: {}",
+                    download_url,
+                    err
+                ));
+                continue;
+            }
+        };
+
+        if !response.status().is_success() {
+            last_error = Some(anyhow::anyhow!(
+                "ClawHub archive request failed, status={} url={}",
+                response.status(),
+                download_url
+            ));
+            continue;
+        }
+
+        let zip_bytes = match response.bytes() {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                last_error = Some(anyhow::anyhow!(
+                    "failed to read ClawHub archive bytes from {}: {}",
+                    download_url,
+                    err
+                ));
+                continue;
+            }
+        };
+
+        let install_result = (|| -> Result<(PathBuf, usize)> {
+            extract_clawhub_zip_secure(&zip_bytes, &dest)?;
+            let report = enforce_skill_security_audit(&dest)?;
+            Ok((dest.clone(), report.files_scanned))
+        })();
+
+        return match install_result {
+            Ok(result) => Ok(result),
+            Err(err) => {
+                let _ = std::fs::remove_dir_all(&dest);
+                Err(err)
+            }
+        };
+    }
+
+    let _ = std::fs::remove_dir_all(&dest);
+    match last_error {
+        Some(err) => Err(err),
+        None => anyhow::bail!("failed to download ClawHub skill: {slug}"),
+    }
+}
+
+fn split_git_source(source: &str) -> (&str, Option<&str>) {
+    match source.rsplit_once('#') {
+        Some((repo, sub_path)) if !repo.trim().is_empty() && !sub_path.trim().is_empty() => {
+            (repo, Some(sub_path))
+        }
+        _ => (source, None),
+    }
+}
+
+fn validate_relative_sub_path(path: &str) -> Result<PathBuf> {
+    let normalized = path.trim().trim_start_matches('/');
+    if normalized.is_empty() {
+        anyhow::bail!("Skill sub-path is empty");
+    }
+
+    let relative = Path::new(normalized);
+    if relative.is_absolute() {
+        anyhow::bail!("Skill sub-path must be relative");
+    }
+
+    if relative
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        anyhow::bail!("Skill sub-path must not contain parent directory traversals");
+    }
+
+    Ok(relative.to_path_buf())
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SkillInstallResult {
+    pub installed_dir: PathBuf,
+    pub files_scanned: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SkillAuditSummary {
+    pub files_scanned: usize,
+    pub findings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SkillMarketItem {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub source: String,
+    pub publisher: String,
+    pub tags: Vec<String>,
+    pub risk_level: String,
+    pub verified: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RemoteSkillMarketCatalog {
+    items: Vec<RemoteSkillMarketItem>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum RemoteSkillMarketPayload {
+    Catalog(RemoteSkillMarketCatalog),
+    Items(Vec<RemoteSkillMarketItem>),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RemoteSkillMarketItem {
+    id: String,
+    name: String,
+    description: String,
+    source: String,
+    publisher: Option<String>,
+    tags: Option<Vec<String>>,
+    risk_level: Option<String>,
+    verified: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ClawHubMarketResponse {
+    items: Vec<ClawHubMarketItem>,
+    #[serde(rename = "nextCursor")]
+    next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ClawHubMarketItem {
+    slug: String,
+    #[serde(rename = "displayName")]
+    display_name: Option<String>,
+    summary: Option<String>,
+    tags: Option<HashMap<String, String>>,
+}
+
+impl SkillAuditSummary {
+    pub fn is_clean(&self) -> bool {
+        self.findings.is_empty()
+    }
+}
+
+fn ensure_valid_skill_name(name: &str) -> Result<()> {
+    if name.contains("..") || name.contains('/') || name.contains('\\') {
+        anyhow::bail!("Invalid skill name: {name}");
+    }
+    Ok(())
+}
+
+pub fn install_skill(workspace_dir: &Path, source: &str) -> Result<SkillInstallResult> {
+    let skills_path = skills_dir(workspace_dir);
+    std::fs::create_dir_all(&skills_path)?;
+
+    let (installed_dir, files_scanned) = if parse_clawhub_slug(source).is_some() {
+        install_clawhub_skill_source(source, &skills_path)
+            .with_context(|| format!("failed to install ClawHub skill source: {source}"))?
+    } else if is_git_source(source) {
+        install_git_skill_source(source, &skills_path)
+            .with_context(|| format!("failed to install git skill source: {source}"))?
+    } else {
+        install_local_skill_source(source, &skills_path)
+            .with_context(|| format!("failed to install local skill source: {source}"))?
+    };
+
+    Ok(SkillInstallResult {
+        installed_dir,
+        files_scanned,
+    })
+}
+
+pub fn audit_skill(workspace_dir: &Path, source: &str) -> Result<SkillAuditSummary> {
+    let source_path = PathBuf::from(source);
+    let target = if source_path.exists() {
+        source_path
+    } else {
+        skills_dir(workspace_dir).join(source)
+    };
+
+    if !target.exists() {
+        anyhow::bail!("Skill source or installed skill not found: {source}");
+    }
+
+    let report = audit::audit_skill_directory(&target)?;
+    Ok(SkillAuditSummary {
+        files_scanned: report.files_scanned,
+        findings: report.findings,
+    })
+}
+
+pub fn remove_skill(workspace_dir: &Path, name: &str) -> Result<()> {
+    ensure_valid_skill_name(name)?;
+
+    let skill_path = skills_dir(workspace_dir).join(name);
+    let canonical_skills = skills_dir(workspace_dir)
+        .canonicalize()
+        .unwrap_or_else(|_| skills_dir(workspace_dir));
+    if let Ok(canonical_skill) = skill_path.canonicalize() {
+        if !canonical_skill.starts_with(&canonical_skills) {
+            anyhow::bail!("Skill path escapes skills directory: {name}");
+        }
+    }
+
+    if !skill_path.exists() {
+        anyhow::bail!("Skill not found: {name}");
+    }
+
+    std::fs::remove_dir_all(&skill_path)?;
+    Ok(())
+}
+
+pub fn market_catalog() -> Vec<SkillMarketItem> {
+    let mut items = Vec::new();
+    let mut seen = HashSet::new();
+
+    if let Some(clawhub) = fetch_clawhub_market_catalog() {
+        append_unique_market_items(&mut items, &mut seen, clawhub);
+    }
+
+    if let Some(remote) = fetch_market_catalog() {
+        append_unique_market_items(&mut items, &mut seen, remote);
+    }
+
+    if !items.is_empty() {
+        return items;
+    }
+
+    vec![SkillMarketItem {
+        id: "open-skills-pack".to_string(),
+        name: "Open Skills Pack".to_string(),
+        description: "Community skills package for digital employee workflows.".to_string(),
+        source: OPEN_SKILLS_REPO_URL.to_string(),
+        publisher: "Open Skills".to_string(),
+        tags: vec![
+            "productivity".to_string(),
+            "research".to_string(),
+            "automation".to_string(),
+        ],
+        risk_level: "high".to_string(),
+        verified: false,
+    }]
+}
+
+fn append_unique_market_items(
+    target: &mut Vec<SkillMarketItem>,
+    seen: &mut HashSet<String>,
+    incoming: Vec<SkillMarketItem>,
+) {
+    for item in incoming {
+        if seen.insert(item.id.clone()) {
+            target.push(item);
+        }
+    }
+}
+
+fn fetch_clawhub_market_catalog() -> Option<Vec<SkillMarketItem>> {
+    let primary_url = std::env::var("ZEROCLAW_CLAWHUB_MARKET_API_URL")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_CLAWHUB_MARKET_API_URL.to_string());
+
+    let fetch = |url: &str| -> Option<Vec<SkillMarketItem>> {
+        let client = reqwest::blocking::Client::new();
+        let mut cursor: Option<String> = None;
+        let mut pages = 0usize;
+        let mut all = Vec::new();
+        let mut seen_slug = HashSet::new();
+
+        while pages < CLAWHUB_MARKET_MAX_PAGES {
+            pages += 1;
+            let mut parsed = reqwest::Url::parse(url).ok()?;
+            {
+                let mut qp = parsed.query_pairs_mut();
+                qp.append_pair("sort", "downloads");
+                qp.append_pair("limit", &CLAWHUB_MARKET_PAGE_LIMIT.to_string());
+                if let Some(current_cursor) = &cursor {
+                    qp.append_pair("cursor", current_cursor);
+                }
+            }
+
+            let response = client
+                .get(parsed)
+                .header(reqwest::header::USER_AGENT, DEFAULT_HTTP_USER_AGENT)
+                .header(reqwest::header::ACCEPT, "application/json")
+                .send()
+                .ok()?;
+            if !response.status().is_success() {
+                tracing::warn!(
+                    "clawhub market fetch failed, status={} url={}",
+                    response.status(),
+                    url
+                );
+                return None;
+            }
+
+            let payload = response.json::<ClawHubMarketResponse>().ok()?;
+            for item in payload.items {
+                let slug = item.slug.trim().to_string();
+                if slug.is_empty() || !seen_slug.insert(slug.clone()) {
+                    continue;
+                }
+                let tags = item
+                    .tags
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(key, _)| key.trim().to_string())
+                    .filter(|value| !value.is_empty() && value != "latest")
+                    .collect::<Vec<_>>();
+                all.push(SkillMarketItem {
+                    id: format!("clawhub-{}", slug),
+                    name: item.display_name.unwrap_or_else(|| slug.clone()),
+                    description: item
+                        .summary
+                        .unwrap_or_else(|| "ClawHub community skill".to_string()),
+                    source: format!("clawhub://{}", slug),
+                    publisher: "ClawHub".to_string(),
+                    tags,
+                    risk_level: "high".to_string(),
+                    verified: false,
+                });
+            }
+
+            if let Some(next) = payload.next_cursor {
+                if next.trim().is_empty() {
+                    break;
+                }
+                cursor = Some(next);
+            } else {
+                break;
+            }
+        }
+
+        all.sort_by(|a, b| {
+            a.name
+                .to_ascii_lowercase()
+                .cmp(&b.name.to_ascii_lowercase())
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        if all.is_empty() {
+            None
+        } else {
+            Some(all)
+        }
+    };
+
+    fetch(&primary_url).or_else(|| {
+        if primary_url == DEFAULT_CLAWHUB_MARKET_API_FALLBACK_URL {
+            None
+        } else {
+            fetch(DEFAULT_CLAWHUB_MARKET_API_FALLBACK_URL)
+        }
+    })
+}
+
+fn fetch_market_catalog() -> Option<Vec<SkillMarketItem>> {
+    let url = std::env::var("ZEROCLAW_SKILL_MARKET_URL")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_SKILL_MARKET_URL.to_string());
+
+    let response = reqwest::blocking::get(&url).ok()?;
+    if !response.status().is_success() {
+        tracing::warn!(
+            "skill market fetch failed, status={} url={}",
+            response.status(),
+            url
+        );
+        return None;
+    }
+
+    let payload = response.json::<RemoteSkillMarketPayload>().ok()?;
+    let remote_items = match payload {
+        RemoteSkillMarketPayload::Catalog(v) => v.items,
+        RemoteSkillMarketPayload::Items(v) => v,
+    };
+    let items: Vec<SkillMarketItem> = remote_items
+        .into_iter()
+        .map(|item| SkillMarketItem {
+            id: item.id,
+            name: item.name,
+            description: item.description,
+            source: item.source,
+            publisher: item.publisher.unwrap_or_else(|| "Unknown".to_string()),
+            tags: item.tags.unwrap_or_default(),
+            risk_level: item.risk_level.unwrap_or_else(|| "high".to_string()),
+            verified: item.verified.unwrap_or(false),
+        })
+        .collect();
+
+    if items.is_empty() {
+        tracing::warn!("skill market fetched empty catalog from {}", url);
+        None
+    } else {
+        Some(items)
+    }
+}
+
+pub fn install_market_skill(workspace_dir: &Path, market_id: &str) -> Result<SkillInstallResult> {
+    let item = market_catalog()
+        .into_iter()
+        .find(|v| v.id == market_id)
+        .with_context(|| format!("Market skill not found: {market_id}"))?;
+    if !is_installable_market_source(&item.source) {
+        anyhow::bail!(
+            "Market item source is not installable: {} (source: {})",
+            item.name,
+            item.source
+        );
+    }
+    install_skill(workspace_dir, &item.source)
+}
+
+fn is_installable_market_source(source: &str) -> bool {
+    parse_clawhub_slug(source).is_some() || is_git_source(source)
 }
 
 /// Handle the `skills` CLI command
@@ -905,57 +1483,19 @@ pub fn handle_command(command: crate::SkillCommands, config: &crate::config::Con
         }
         crate::SkillCommands::Install { source } => {
             println!("Installing skill from: {source}");
-
-            let skills_path = skills_dir(workspace_dir);
-            std::fs::create_dir_all(&skills_path)?;
-
-            if is_git_source(&source) {
-                let (installed_dir, files_scanned) =
-                    install_git_skill_source(&source, &skills_path)
-                        .with_context(|| format!("failed to install git skill source: {source}"))?;
-                println!(
-                    "  {} Skill installed and audited: {} ({} files scanned)",
-                    console::style("✓").green().bold(),
-                    installed_dir.display(),
-                    files_scanned
-                );
-            } else {
-                let (dest, files_scanned) = install_local_skill_source(&source, &skills_path)
-                    .with_context(|| format!("failed to install local skill source: {source}"))?;
-                println!(
-                    "  {} Skill installed and audited: {} ({} files scanned)",
-                    console::style("✓").green().bold(),
-                    dest.display(),
-                    files_scanned
-                );
-            }
+            let result = install_skill(workspace_dir, &source)?;
+            println!(
+                "  {} Skill installed and audited: {} ({} files scanned)",
+                console::style("✓").green().bold(),
+                result.installed_dir.display(),
+                result.files_scanned
+            );
 
             println!("  Security audit completed successfully.");
             Ok(())
         }
         crate::SkillCommands::Remove { name } => {
-            // Reject path traversal attempts
-            if name.contains("..") || name.contains('/') || name.contains('\\') {
-                anyhow::bail!("Invalid skill name: {name}");
-            }
-
-            let skill_path = skills_dir(workspace_dir).join(&name);
-
-            // Verify the resolved path is actually inside the skills directory
-            let canonical_skills = skills_dir(workspace_dir)
-                .canonicalize()
-                .unwrap_or_else(|_| skills_dir(workspace_dir));
-            if let Ok(canonical_skill) = skill_path.canonicalize() {
-                if !canonical_skill.starts_with(&canonical_skills) {
-                    anyhow::bail!("Skill path escapes skills directory: {name}");
-                }
-            }
-
-            if !skill_path.exists() {
-                anyhow::bail!("Skill not found: {name}");
-            }
-
-            std::fs::remove_dir_all(&skill_path)?;
+            remove_skill(workspace_dir, &name)?;
             println!(
                 "  {} Skill '{}' removed.",
                 console::style("✓").green().bold(),

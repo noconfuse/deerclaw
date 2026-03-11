@@ -1,0 +1,27 @@
+[package]
+name = "zeroclaw-desktop"
+version = "0.1.7"
+description = "ZeroClaw Desktop Wrapper"
+authors = ["theonlyhennygod"]
+edition = "2021"
+rust-version = "1.70"
+
+[features]
+# this feature is used for production builds or when `devPath` points to the filesystem
+# DO NOT REMOVE!!
+custom-protocol = ["tauri/custom-protocol"]
+
+[build-dependencies]
+tauri-build = { version = "1.5", features = [] }
+
+[dependencies]
+tauri = { version = "1.5", features = ["shell-open", "process-command-api"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+zeroclaw = { path = "../.." }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+tokio = { version = "1.42", features = ["full"] }
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "ansi", "env-filter"] }
+log = "0.4"

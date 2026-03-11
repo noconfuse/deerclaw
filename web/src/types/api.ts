@@ -88,6 +88,49 @@ export interface CliTool {
   category: string;
 }
 
+export interface SkillTool {
+  name: string;
+  description: string;
+  kind: string;
+  command: string;
+  args: Record<string, string>;
+}
+
+export interface SkillSpec {
+  name: string;
+  description: string;
+  version: string;
+  author: string | null;
+  tags: string[];
+  tools: SkillTool[];
+  prompts: string[];
+  location: string | null;
+}
+
+export interface SkillInstallResult {
+  status: string;
+  installed_dir: string;
+  files_scanned: number;
+}
+
+export interface SkillAuditResult {
+  status: string;
+  files_scanned: number;
+  findings: string[];
+  clean: boolean;
+}
+
+export interface SkillMarketItem {
+  id: string;
+  name: string;
+  description: string;
+  source: string;
+  publisher: string;
+  tags: string[];
+  risk_level: string;
+  verified: boolean;
+}
+
 export interface SSEEvent {
   type: string;
   timestamp?: string;

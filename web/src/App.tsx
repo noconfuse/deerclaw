@@ -1,5 +1,6 @@
 import { Routes, Route, Navigate } from 'react-router-dom';
 import { useState, useEffect, createContext, useContext } from 'react';
+import { useTranslation } from 'react-i18next';
 import Layout from './components/layout/Layout';
 import Dashboard from './pages/Dashboard';
 import AgentChat from './pages/AgentChat';
@@ -11,8 +12,11 @@ import Config from './pages/Config';
 import Cost from './pages/Cost';
 import Logs from './pages/Logs';
 import Doctor from './pages/Doctor';
+import SkillMarket from './pages/SkillMarket';
+import Onboard from './pages/Onboard';
 import { AuthProvider, useAuth } from './hooks/useAuth';
 import { setLocale, type Locale } from './lib/i18n';
+import { getOnboardStatus } from './lib/api';
 
 // Locale context
 interface LocaleContextType {
@@ -21,7 +25,7 @@ interface LocaleContextType {
 }
 
 export const LocaleContext = createContext<LocaleContextType>({
-  locale: 'tr',
+  locale: 'zh',
   setAppLocale: () => {},
 });
 
@@ -29,6 +33,7 @@ export const useLocaleContext = () => useContext(LocaleContext);
 
 // Pairing dialog component
 function PairingDialog({ onPair }: { onPair: (code: string) => Promise<void> }) {
+  const { t } = useTranslation();
   const [code, setCode] = useState('');
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
@@ -40,7 +45,7 @@ function PairingDialog({ onPair }: { onPair: (code: string) => Promise<void> }) 
     try {
       await onPair(code);
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : 'Pairing failed');
+      setError(err instanceof Error ? err.message : t('auth.pairing_failed'));
     } finally {
       setLoading(false);
     }
@@ -50,15 +55,15 @@ function PairingDialog({ onPair }: { onPair: (code: string) => Promise<void> }) 
     <div className="min-h-screen bg-gray-950 flex items-center justify-center">
       <div className="bg-gray-900 rounded-xl p-8 w-full max-w-md border border-gray-800">
         <div className="text-center mb-6">
-          <h1 className="text-2xl font-bold text-white mb-2">ZeroClaw</h1>
-          <p className="text-gray-400">Enter the pairing code from your terminal</p>
+          <h1 className="text-2xl font-bold text-white mb-2">DeerClaw</h1>
+          <p className="text-gray-400">{t('auth.enter_code')}</p>
         </div>
         <form onSubmit={handleSubmit}>
           <input
             type="text"
             value={code}
             onChange={(e) => setCode(e.target.value)}
-            placeholder="6-digit code"
+            placeholder={t('auth.pairing_code')}
             className="w-full px-4 py-3 bg-gray-800 border border-gray-700 rounded-lg text-white text-center text-2xl tracking-widest focus:outline-none focus:border-blue-500 mb-4"
             maxLength={6}
             autoFocus
@@ -71,7 +76,7 @@ function PairingDialog({ onPair }: { onPair: (code: string) => Promise<void> }) 
             disabled={loading || code.length < 6}
             className="w-full py-3 bg-blue-600 hover:bg-blue-700 disabled:bg-gray-700 disabled:text-gray-500 text-white rounded-lg font-medium transition-colors"
           >
-            {loading ? 'Pairing...' : 'Pair'}
+            {loading ? t('auth.pairing') : t('auth.pair_button')}
           </button>
         </form>
       </div>
@@ -80,8 +85,40 @@ function PairingDialog({ onPair }: { onPair: (code: string) => Promise<void> }) 
 }
 
 function AppContent() {
-  const { isAuthenticated, loading, pair, logout } = useAuth();
-  const [locale, setLocaleState] = useState('tr');
+  const { t } = useTranslation();
+  const { isAuthenticated, loading: authLoading, pair, logout } = useAuth();
+  const [locale, setLocaleState] = useState('zh');
+  const [onboardStatus, setOnboardStatus] = useState<{ configured: boolean } | null>(null);
+  const [onboardLoading, setOnboardLoading] = useState(true);
+
+  // Check onboarding status
+  useEffect(() => {
+    let cancelled = false;
+    const checkOnboard = async (retries = 10, delay = 500) => {
+      try {
+        const status = await getOnboardStatus();
+        if (cancelled) return;
+        setOnboardStatus(status);
+        setOnboardLoading(false);
+      } catch (err) {
+        if (cancelled) return;
+        if (retries > 0) {
+          setTimeout(() => checkOnboard(retries - 1, delay), delay);
+        } else {
+          // If check fails after retries, assume configured to avoid blocking
+          console.error('Failed to check onboard status', err);
+          setOnboardStatus({ configured: true });
+          setOnboardLoading(false);
+        }
+      }
+    };
+
+    checkOnboard();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const setAppLocale = (newLocale: string) => {
     setLocaleState(newLocale);
@@ -97,12 +134,17 @@ function AppContent() {
     return () => window.removeEventListener('zeroclaw-unauthorized', handler);
   }, [logout]);
 
-  if (loading) {
+  if (authLoading || onboardLoading) {
     return (
       <div className="min-h-screen bg-gray-950 flex items-center justify-center">
-        <p className="text-gray-400">Connecting...</p>
+        <p className="text-gray-400">{t('common.loading')}</p>
       </div>
     );
+  }
+
+  // If not configured, show onboarding
+  if (onboardStatus && !onboardStatus.configured) {
+    return <Onboard />;
   }
 
   if (!isAuthenticated) {
@@ -123,6 +165,7 @@ function AppContent() {
           <Route path="/cost" element={<Cost />} />
           <Route path="/logs" element={<Logs />} />
           <Route path="/doctor" element={<Doctor />} />
+          <Route path="/skill-market" element={<SkillMarket />} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Route>
       </Routes>

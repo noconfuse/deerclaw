@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/robot-kit"]
+members = [".", "crates/robot-kit", "desktop/src-tauri"]
 resolver = "2"
 
 [package]
@@ -110,6 +110,7 @@ console = "0.16"
 
 # Hardware discovery (device path globbing)
 glob = "0.3"
+zip = { version = "0.6", default-features = false, features = ["deflate"] }
 
 # Binary discovery (init system detection)
 which = "8.0"

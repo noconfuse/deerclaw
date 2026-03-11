@@ -5911,11 +5911,17 @@ mod tests {
     #[tokio::test]
     async fn quick_setup_existing_config_overwrites_with_force() {
         let _env_guard = env_lock().lock().await;
-        let _workspace_env = EnvVarGuard::unset("ZEROCLAW_WORKSPACE");
-        let _config_env = EnvVarGuard::unset("ZEROCLAW_CONFIG_DIR");
         let tmp = TempDir::new().unwrap();
         let zeroclaw_dir = tmp.path().join(".zeroclaw");
         let config_path = zeroclaw_dir.join("config.toml");
+
+        // Force default config dir to our temp dir so we don't pollute ~/.zeroclaw
+        let _config_env = EnvVarGuard::set(
+            "ZEROCLAW_CONFIG_DIR",
+            zeroclaw_dir.to_str().unwrap(),
+        );
+
+        let _workspace_env = EnvVarGuard::unset("ZEROCLAW_WORKSPACE");
 
         tokio::fs::create_dir_all(&zeroclaw_dir).await.unwrap();
         tokio::fs::write(
