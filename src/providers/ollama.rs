@@ -1,3 +1,4 @@
+use crate::cost::tracker::CostTracker;
 use crate::multimodal;
 use crate::providers::traits::{
     ChatMessage, ChatResponse, Provider, ProviderCapabilities, TokenUsage, ToolCall,
@@ -6,11 +7,13 @@ use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 pub struct OllamaProvider {
     base_url: String,
     api_key: Option<String>,
     reasoning_enabled: Option<bool>,
+    cost_tracker: Option<Arc<CostTracker>>,
 }
 
 // ─── Request Structures ───────────────────────────────────────────────────────
@@ -127,7 +130,13 @@ impl OllamaProvider {
             base_url: Self::normalize_base_url(base_url.unwrap_or("http://localhost:11434")),
             api_key,
             reasoning_enabled,
+            cost_tracker: None,
         }
+    }
+
+    pub fn with_cost_tracker(mut self, cost_tracker: Option<Arc<CostTracker>>) -> Self {
+        self.cost_tracker = cost_tracker;
+        self
     }
 
     fn is_local_endpoint(&self) -> bool {
@@ -409,6 +418,16 @@ impl OllamaProvider {
                 anyhow::bail!("Failed to parse Ollama response: {e}");
             }
         };
+
+        if let Some(ref tracker) = self.cost_tracker {
+            if let Err(e) = tracker.record_usage_with_model(
+                model,
+                chat_response.prompt_eval_count.unwrap_or(0),
+                chat_response.eval_count.unwrap_or(0),
+            ) {
+                tracing::warn!("Failed to record cost for {}: {}", model, e);
+            }
+        }
 
         Ok(chat_response)
     }

@@ -748,6 +748,75 @@ impl Memory for SqliteMemory {
         .await?
     }
 
+    async fn list_paginated(
+        &self,
+        category: Option<&MemoryCategory>,
+        session_id: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let conn = self.conn.clone();
+        let category = category.cloned();
+        let sid = session_id.map(String::from);
+        let limit = limit as i64;
+        let offset = offset as i64;
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEntry>> {
+            let conn = conn.lock();
+            let mut sql =
+                "SELECT id, key, content, category, created_at, session_id FROM memories"
+                    .to_string();
+            let mut conditions = Vec::new();
+            let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+
+            if let Some(ref cat) = category {
+                conditions.push("category = ?".to_string());
+                param_values.push(Box::new(Self::category_to_str(cat)));
+            }
+
+            if let Some(ref sid) = sid {
+                conditions.push("session_id = ?".to_string());
+                param_values.push(Box::new(sid.clone()));
+            }
+
+            if !conditions.is_empty() {
+                sql.push_str(" WHERE ");
+                sql.push_str(&conditions.join(" AND "));
+            }
+
+            sql.push_str(" ORDER BY created_at DESC LIMIT ? OFFSET ?");
+            param_values.push(Box::new(limit));
+            param_values.push(Box::new(offset));
+
+            let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+                param_values.iter().map(AsRef::as_ref).collect();
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(params_ref.as_slice(), |row| {
+                Ok(MemoryEntry {
+                    id: row.get(0)?,
+                    key: row.get(1)?,
+                    content: row.get(2)?,
+                    category: Self::str_to_category(&row.get::<_, String>(3)?),
+                    timestamp: row.get(4)?,
+                    session_id: row.get(5)?,
+                    score: None,
+                })
+            })?;
+
+            let mut results = Vec::new();
+            for row in rows {
+                results.push(row?);
+            }
+
+            Ok(results)
+        })
+        .await?
+    }
+
     async fn forget(&self, key: &str) -> anyhow::Result<bool> {
         let conn = self.conn.clone();
         let key = key.to_string();

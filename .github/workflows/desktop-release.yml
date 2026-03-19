@@ -1,0 +1,129 @@
+name: Desktop Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Desktop version (e.g. 0.1.8)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    name: Validate Desktop Version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.validate.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate version consistency
+        id: validate
+        shell: bash
+        run: |
+          set -euo pipefail
+          input_version="${{ inputs.version }}"
+          if [[ ! "$input_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Invalid version format: ${input_version}"
+            exit 1
+          fi
+          export INPUT_VERSION="$input_version"
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+          import re
+          import sys
+
+          root = pathlib.Path(".")
+          input_version = os.environ["INPUT_VERSION"]
+          checks = []
+
+          cargo_desktop = (root / "desktop/src-tauri/Cargo.toml").read_text(encoding="utf-8")
+          m = re.search(r'^version = "([^"]+)"', cargo_desktop, flags=re.M)
+          checks.append(("desktop/src-tauri/Cargo.toml", m.group(1) if m else None))
+
+          tauri_conf = json.loads((root / "desktop/src-tauri/tauri.conf.json").read_text(encoding="utf-8"))
+          checks.append(("desktop/src-tauri/tauri.conf.json", tauri_conf["package"]["version"]))
+
+          desktop_pkg = json.loads((root / "desktop/package.json").read_text(encoding="utf-8"))
+          checks.append(("desktop/package.json", desktop_pkg["version"]))
+
+          root_cargo = (root / "Cargo.toml").read_text(encoding="utf-8")
+          m_root = re.search(r'^version = "([^"]+)"', root_cargo, flags=re.M)
+          checks.append(("Cargo.toml", m_root.group(1) if m_root else None))
+
+          failed = [(path, ver) for path, ver in checks if ver != input_version]
+          if failed:
+            for path, ver in failed:
+              print(f"::error::{path} version is {ver}, expected {input_version}")
+            sys.exit(1)
+          PY
+          echo "version=${input_version}" >> "$GITHUB_OUTPUT"
+
+  build-and-release:
+    name: Build Desktop (${{ matrix.platform }})
+    needs: [validate]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux
+            os: ubuntu-22.04
+          - platform: macos
+            os: macos-14
+          - platform: windows
+            os: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: |
+            web/package-lock.json
+            desktop/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.92.0
+
+      - name: Install Linux dependencies
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            libwebkit2gtk-4.0-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf
+
+      - name: Build web assets
+        shell: bash
+        run: |
+          cd web
+          npm ci
+          npm run build
+
+      - name: Install desktop dependencies
+        shell: bash
+        run: |
+          cd desktop
+          npm ci
+
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
+          TAURI_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
+        with:
+          projectPath: desktop
+          tagName: desktop-latest
+          releaseName: Desktop Update Channel
+          releaseBody: Automated desktop update channel release (current app version: __VERSION__)
+          releaseDraft: false
+          prerelease: false

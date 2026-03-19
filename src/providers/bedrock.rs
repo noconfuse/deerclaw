@@ -451,20 +451,33 @@ struct ResponseToolUseWrapper {
 
 // ── BedrockProvider ─────────────────────────────────────────────
 
+use crate::cost::CostTracker;
+use std::sync::Arc;
+
 pub struct BedrockProvider {
     credentials: Option<AwsCredentials>,
+    cost_tracker: Option<Arc<CostTracker>>,
 }
 
 impl BedrockProvider {
     pub fn new() -> Self {
         Self {
             credentials: AwsCredentials::from_env().ok(),
+            cost_tracker: None,
         }
     }
 
     pub async fn new_async() -> Self {
         let credentials = AwsCredentials::resolve().await.ok();
-        Self { credentials }
+        Self {
+            credentials,
+            cost_tracker: None,
+        }
+    }
+
+    pub fn with_cost_tracker(mut self, cost_tracker: Option<Arc<CostTracker>>) -> Self {
+        self.cost_tracker = cost_tracker;
+        self
     }
 
     fn http_client(&self) -> Client {
@@ -1084,6 +1097,18 @@ impl Provider for BedrockProvider {
             .send_converse_request(&credentials, model, &converse_request)
             .await?;
 
+        if let Some(ref tracker) = self.cost_tracker {
+            if let Some(usage) = &response.usage {
+                if let Err(e) = tracker.record_usage_with_model(
+                    model,
+                    usage.input_tokens.unwrap_or(0),
+                    usage.output_tokens.unwrap_or(0),
+                ) {
+                    tracing::warn!("Failed to record cost for {}: {}", model, e);
+                }
+            }
+        }
+
         Ok(Self::parse_converse_response(response))
     }
 
@@ -1254,7 +1279,10 @@ mod tests {
 
     #[tokio::test]
     async fn chat_fails_without_credentials() {
-        let provider = BedrockProvider { credentials: None };
+        let provider = BedrockProvider {
+            credentials: None,
+            cost_tracker: None,
+        };
         let result = provider
             .chat_with_system(None, "hello", "anthropic.claude-sonnet-4-6", 0.7)
             .await;
@@ -1549,14 +1577,20 @@ mod tests {
 
     #[tokio::test]
     async fn warmup_without_credentials_is_noop() {
-        let provider = BedrockProvider { credentials: None };
+        let provider = BedrockProvider {
+            credentials: None,
+            cost_tracker: None,
+        };
         let result = provider.warmup().await;
         assert!(result.is_ok());
     }
 
     #[test]
     fn capabilities_reports_native_tool_calling() {
-        let provider = BedrockProvider { credentials: None };
+        let provider = BedrockProvider {
+            credentials: None,
+            cost_tracker: None,
+        };
         let caps = provider.capabilities();
         assert!(caps.native_tool_calling);
     }

@@ -77,7 +77,7 @@ echo "Created annotated tag: $TAG"
 if [[ "$PUSH_TAG" == "true" ]]; then
   git push origin "$TAG"
   echo "Pushed tag to origin: $TAG"
-  echo "GitHub release pipeline will run via .github/workflows/pub-release.yml"
+  echo "GitHub release pipeline can be triggered via .github/workflows/promote-release.yml"
 else
   echo "Next step: git push origin $TAG"
 fi

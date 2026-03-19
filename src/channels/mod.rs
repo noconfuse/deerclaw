@@ -275,6 +275,13 @@ fn conversation_history_key(msg: &traits::ChannelMessage) -> String {
     }
 }
 
+fn channel_session_id(msg: &traits::ChannelMessage) -> String {
+    match &msg.thread_ts {
+        Some(tid) => format!("channel:{}:{}:{}", msg.channel, msg.sender, tid),
+        None => format!("channel:{}:{}", msg.channel, msg.sender),
+    }
+}
+
 fn interruption_scope_key(msg: &traits::ChannelMessage) -> String {
     format!("{}_{}_{}", msg.channel, msg.reply_target, msg.sender)
 }
@@ -789,6 +796,34 @@ fn append_sender_turn(ctx: &ChannelRuntimeContext, sender_key: &str, turn: ChatM
     turns.push(turn);
     while turns.len() > MAX_CHANNEL_HISTORY {
         turns.remove(0);
+    }
+}
+
+async fn store_channel_turn(
+    ctx: &ChannelRuntimeContext,
+    msg: &traits::ChannelMessage,
+    turn: &ChatMessage,
+) {
+    let payload = match serde_json::to_string(turn) {
+        Ok(value) => value,
+        Err(err) => {
+            tracing::debug!("Failed to serialize channel chat message: {err}");
+            return;
+        }
+    };
+    let session_id = channel_session_id(msg);
+    let key = format!("chat:{}:{}", session_id, uuid::Uuid::new_v4());
+    if let Err(err) = ctx
+        .memory
+        .store(
+            &key,
+            &payload,
+            crate::memory::MemoryCategory::Conversation,
+            Some(&session_id),
+        )
+        .await
+    {
+        tracing::debug!("Failed to store channel chat message: {err}");
     }
 }
 
@@ -1602,8 +1637,9 @@ async fn process_channel_message(
         .get(&history_key)
         .is_some_and(|turns| !turns.is_empty());
 
-    // Preserve user turn before the LLM call so interrupted requests keep context.
-    append_sender_turn(ctx.as_ref(), &history_key, ChatMessage::user(&msg.content));
+    let user_turn = ChatMessage::user(&msg.content);
+    append_sender_turn(ctx.as_ref(), &history_key, user_turn.clone());
+    store_channel_turn(ctx.as_ref(), &msg, &user_turn).await;
 
     // Build history from per-sender conversation cache.
     let prior_turns_raw = ctx
@@ -1895,11 +1931,9 @@ async fn process_channel_message(
                 format!("{tool_summary}\n{delivered_response}")
             };
 
-            append_sender_turn(
-                ctx.as_ref(),
-                &history_key,
-                ChatMessage::assistant(&history_response),
-            );
+            let assistant_turn = ChatMessage::assistant(&history_response);
+            append_sender_turn(ctx.as_ref(), &history_key, assistant_turn.clone());
+            store_channel_turn(ctx.as_ref(), &msg, &assistant_turn).await;
             println!(
                 "  🤖 Reply ({}ms): {}",
                 started_at.elapsed().as_millis(),
@@ -3028,12 +3062,20 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
 #[allow(clippy::too_many_lines)]
 pub async fn start_channels(config: Config) -> Result<()> {
     let provider_name = resolved_default_provider(&config);
+    let cost_tracker = match crate::cost::CostTracker::new(config.cost.clone(), &config.workspace_dir) {
+        Ok(ct) => Some(Arc::new(ct)),
+        Err(e) => {
+            tracing::warn!("Failed to initialize cost tracker: {e}");
+            None
+        }
+    };
     let provider_runtime_options = providers::ProviderRuntimeOptions {
         auth_profile_override: None,
         provider_api_url: config.api_url.clone(),
         zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
         secrets_encrypt: config.secrets.encrypt,
         reasoning_enabled: config.runtime.reasoning_enabled,
+        cost_tracker,
     };
     let provider: Arc<dyn Provider> = Arc::from(
         create_resilient_provider_nonblocking(
@@ -3092,10 +3134,10 @@ pub async fn start_channels(config: Config) -> Result<()> {
     };
     // Build system prompt from workspace identity files + skills
     let workspace = config.workspace_dir.clone();
-    let tools_registry = Arc::new(tools::all_tools_with_runtime(
+    let mut tools_list = tools::all_tools_with_runtime(
         Arc::new(config.clone()),
         &security,
-        runtime,
+        runtime.clone(),
         Arc::clone(&mem),
         composio_key,
         composio_entity_id,
@@ -3106,9 +3148,25 @@ pub async fn start_channels(config: Config) -> Result<()> {
         &config.agents,
         config.api_key.as_deref(),
         &config,
-    ));
+    );
 
     let skills = crate::skills::load_skills_with_config(&workspace, &config);
+
+    // Register skill-defined tools via proxy adapter
+    for skill in &skills {
+        for tool in &skill.tools {
+            if tool.kind == "shell" {
+                let proxy = crate::skills::adapter::SkillProxyTool::new(
+                    tool.clone(),
+                    runtime.clone(),
+                    security.clone(),
+                );
+                tools_list.push(Box::new(proxy));
+            }
+        }
+    }
+
+    let tools_registry = Arc::new(tools_list);
 
     // Collect tool descriptions for the prompt
     let mut tool_descs: Vec<(&str, &str)> = vec![

@@ -23,9 +23,14 @@ pub struct RouterProvider {
     providers: Vec<(String, Box<dyn Provider>)>,
     default_index: usize,
     default_model: String,
+    cost_tracker: Option<std::sync::Arc<crate::cost::CostTracker>>,
 }
 
 impl RouterProvider {
+    pub fn with_cost_tracker(mut self, cost_tracker: Option<std::sync::Arc<crate::cost::CostTracker>>) -> Self {
+        self.cost_tracker = cost_tracker;
+        self
+    }
     /// Create a new router with a default provider and optional routes.
     ///
     /// `providers` is a list of (name, provider) pairs. The first one is the default.
@@ -66,6 +71,7 @@ impl RouterProvider {
             providers,
             default_index: 0,
             default_model,
+            cost_tracker: None,
         }
     }
 
@@ -108,9 +114,12 @@ impl Provider for RouterProvider {
             "Router dispatching request"
         );
 
-        provider
+        let response = provider
             .chat_with_system(system_prompt, message, &resolved_model, temperature)
-            .await
+            .await?;
+
+        // RouterProvider delegates cost tracking to the underlying provider
+        Ok(response)
     }
 
     async fn chat_with_history(

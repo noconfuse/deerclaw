@@ -1,3 +1,4 @@
+use crate::cost::CostTracker;
 use crate::multimodal;
 use crate::providers::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
@@ -7,9 +8,11 @@ use crate::tools::ToolSpec;
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 pub struct OpenRouterProvider {
     credential: Option<String>,
+    cost_tracker: Option<Arc<CostTracker>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -47,6 +50,8 @@ struct ImageUrlPart {
 #[derive(Debug, Deserialize)]
 struct ApiChatResponse {
     choices: Vec<Choice>,
+    #[serde(default)]
+    usage: Option<UsageInfo>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -149,7 +154,13 @@ impl OpenRouterProvider {
     pub fn new(credential: Option<&str>) -> Self {
         Self {
             credential: credential.map(ToString::to_string),
+            cost_tracker: None,
         }
+    }
+
+    pub fn with_cost_tracker(mut self, cost_tracker: Option<Arc<CostTracker>>) -> Self {
+        self.cost_tracker = cost_tracker;
+        self
     }
 
     fn convert_tools(tools: Option<&[ToolSpec]>) -> Option<Vec<NativeToolSpec>> {
@@ -372,6 +383,18 @@ impl Provider for OpenRouterProvider {
 
         let chat_response: ApiChatResponse = response.json().await?;
 
+        if let Some(tracker) = &self.cost_tracker {
+            if let Some(u) = &chat_response.usage {
+                if let Err(e) = tracker.record_usage_with_model(
+                    model,
+                    u.prompt_tokens.unwrap_or(0),
+                    u.completion_tokens.unwrap_or(0),
+                ) {
+                    tracing::warn!("Failed to record cost: {}", e);
+                }
+            }
+        }
+
         chat_response
             .choices
             .into_iter()
@@ -421,6 +444,18 @@ impl Provider for OpenRouterProvider {
         }
 
         let chat_response: ApiChatResponse = response.json().await?;
+
+        if let Some(tracker) = &self.cost_tracker {
+            if let Some(u) = &chat_response.usage {
+                if let Err(e) = tracker.record_usage_with_model(
+                    model,
+                    u.prompt_tokens.unwrap_or(0),
+                    u.completion_tokens.unwrap_or(0),
+                ) {
+                    tracing::warn!("Failed to record cost: {}", e);
+                }
+            }
+        }
 
         chat_response
             .choices
@@ -473,6 +508,19 @@ impl Provider for OpenRouterProvider {
             input_tokens: u.prompt_tokens,
             output_tokens: u.completion_tokens,
         });
+
+        if let Some(tracker) = &self.cost_tracker {
+            if let Some(u) = &usage {
+                if let Err(e) = tracker.record_usage_with_model(
+                    model,
+                    u.input_tokens.unwrap_or(0),
+                    u.output_tokens.unwrap_or(0),
+                ) {
+                    tracing::warn!("Failed to record cost: {}", e);
+                }
+            }
+        }
+
         let message = native_response
             .choices
             .into_iter()
@@ -567,6 +615,19 @@ impl Provider for OpenRouterProvider {
             input_tokens: u.prompt_tokens,
             output_tokens: u.completion_tokens,
         });
+
+        if let Some(tracker) = &self.cost_tracker {
+            if let Some(u) = &usage {
+                if let Err(e) = tracker.record_usage_with_model(
+                    model,
+                    u.input_tokens.unwrap_or(0),
+                    u.output_tokens.unwrap_or(0),
+                ) {
+                    tracing::warn!("Failed to record cost: {}", e);
+                }
+            }
+        }
+
         let message = native_response
             .choices
             .into_iter()

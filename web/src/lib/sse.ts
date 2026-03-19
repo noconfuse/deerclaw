@@ -113,8 +113,9 @@ export class SSEClient {
         if (done) break;
 
         buffer += decoder.decode(value, { stream: true });
+        buffer = buffer.replace(/\r\n/g, '\n');
 
-        // SSE events are separated by double newlines
+        // SSE events are separated by empty lines
         const parts = buffer.split('\n\n');
         buffer = parts.pop() ?? '';
 
@@ -139,7 +140,8 @@ export class SSEClient {
     let eventType = 'message';
     const dataLines: string[] = [];
 
-    for (const line of raw.split('\n')) {
+    for (const rawLine of raw.split('\n')) {
+      const line = rawLine.replace(/\r$/, '');
       if (line.startsWith('event:')) {
         eventType = line.slice(6).trim();
       } else if (line.startsWith('data:')) {

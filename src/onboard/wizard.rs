@@ -5916,10 +5916,7 @@ mod tests {
         let config_path = zeroclaw_dir.join("config.toml");
 
         // Force default config dir to our temp dir so we don't pollute ~/.zeroclaw
-        let _config_env = EnvVarGuard::set(
-            "ZEROCLAW_CONFIG_DIR",
-            zeroclaw_dir.to_str().unwrap(),
-        );
+        let _config_env = EnvVarGuard::set("ZEROCLAW_CONFIG_DIR", zeroclaw_dir.to_str().unwrap());
 
         let _workspace_env = EnvVarGuard::unset("ZEROCLAW_WORKSPACE");
 

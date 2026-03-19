@@ -1,7 +1,8 @@
 import { useState, type FormEvent } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Bot, Sparkles, CheckCircle, AlertTriangle, ChevronRight, ChevronDown, Server, Globe, Zap, Box, Code, Cpu } from 'lucide-react';
+import { Sparkles, CheckCircle, AlertTriangle, ChevronRight, ChevronDown, Server, Globe, Zap, Box, Code, Cpu } from 'lucide-react';
 import { onboardInit } from '@/lib/api';
+import { Logo } from '@/components/ui/Logo';
 
 type ProviderDef = {
   id: string;
@@ -621,8 +622,8 @@ export default function Onboard() {
       <div className="relative z-10 max-w-5xl mx-auto px-6 py-12 min-h-screen flex flex-col">
         {/* Header */}
         <div className="flex flex-col items-center mb-8 animate-in fade-in slide-in-from-top-4 duration-700">
-          <div className="w-16 h-16 bg-blue-600/20 rounded-2xl flex items-center justify-center mb-6 backdrop-blur-sm border border-blue-500/20 shadow-[0_0_30px_-10px_rgba(37,99,235,0.3)]">
-            <Bot className="h-8 w-8 text-blue-400" />
+          <div className="mb-6">
+            <Logo className="h-24 w-24" />
           </div>
           <h1 className="text-4xl font-bold text-transparent bg-clip-text bg-linear-to-b from-white to-gray-400 mb-3 tracking-tight">
             {t('onboard.welcome')}

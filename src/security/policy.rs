@@ -714,7 +714,7 @@ impl SecurityPolicy {
     /// Validates the **entire** command string, not just the first word:
     /// - Blocks subshell operators (`` ` ``, `$(`) that hide arbitrary execution
     /// - Splits on command separators (`|`, `&&`, `||`, `;`, newlines) and
-    ///   validates each sub-command against the allowlist
+    ///   validates each sub-command against the allowlist (except Full autonomy)
     /// - Blocks single `&` background chaining (`&&` remains supported)
     /// - Blocks shell redirections (`<`, `>`, `>>`) that can bypass path policy
     /// - Blocks dangerous arguments (e.g. `find -exec`, `git config`)
@@ -772,10 +772,11 @@ impl SecurityPolicy {
                 continue;
             }
 
-            if !self
-                .allowed_commands
-                .iter()
-                .any(|allowed| is_allowlist_entry_match(allowed, executable, base_cmd))
+            if self.autonomy != AutonomyLevel::Full
+                && !self
+                    .allowed_commands
+                    .iter()
+                    .any(|allowed| is_allowlist_entry_match(allowed, executable, base_cmd))
             {
                 return false;
             }
@@ -1191,10 +1192,12 @@ mod tests {
     }
 
     #[test]
-    fn full_autonomy_still_uses_allowlist() {
+    fn full_autonomy_allows_non_allowlisted_commands() {
         let p = full_policy();
         assert!(p.is_command_allowed("ls"));
-        assert!(!p.is_command_allowed("rm -rf /"));
+        assert!(p.is_command_allowed(
+            "osascript -e 'tell application \"Calendar\" to activate'"
+        ));
     }
 
     #[test]

@@ -561,8 +561,8 @@ impl Default for IdentityConfig {
 /// Cost tracking and budget enforcement configuration (`[cost]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct CostConfig {
-    /// Enable cost tracking (default: false)
-    #[serde(default)]
+    /// Enable cost tracking (default: true)
+    #[serde(default = "default_true")]
     pub enabled: bool,
 
     /// Daily spending limit in USD (default: 10.00)
@@ -613,7 +613,7 @@ fn default_warn_percent() -> u8 {
 impl Default for CostConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             daily_limit_usd: default_daily_limit(),
             monthly_limit_usd: default_monthly_limit(),
             warn_at_percent: default_warn_percent(),
@@ -5219,6 +5219,7 @@ default_temperature = 0.7
         assert_eq!(parsed.memory.archive_after_days, 7);
         assert_eq!(parsed.memory.purge_after_days, 30);
         assert_eq!(parsed.memory.conversation_retention_days, 30);
+        assert!(parsed.cost.enabled);
     }
 
     #[test]
@@ -6000,15 +6001,24 @@ channel_id = "C123"
     #[test]
     async fn config_default_provider_is_none() {
         let c = Config::default();
-        assert!(c.default_provider.is_none(), "Default provider should be None to force onboarding");
-        assert!(!c.is_configured(), "is_configured() should be false by default");
+        assert!(
+            c.default_provider.is_none(),
+            "Default provider should be None to force onboarding"
+        );
+        assert!(
+            !c.is_configured(),
+            "is_configured() should be false by default"
+        );
     }
 
     #[test]
     async fn config_is_configured_true_when_provider_set() {
         let mut c = Config::default();
         c.default_provider = Some("foo".to_string());
-        assert!(c.is_configured(), "is_configured() should be true when provider is set");
+        assert!(
+            c.is_configured(),
+            "is_configured() should be true when provider is set"
+        );
     }
 
     #[test]

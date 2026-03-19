@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime};
 
+pub mod adapter;
 mod audit;
 
 const OPEN_SKILLS_REPO_URL: &str = "https://github.com/besoeasy/open-skills";
@@ -15,7 +16,8 @@ const OPEN_SKILLS_SYNC_INTERVAL_SECS: u64 = 60 * 60 * 24 * 7;
 const DEFAULT_SKILL_MARKET_URL: &str =
     "https://raw.githubusercontent.com/besoeasy/open-skills/main/market/catalog.json";
 const DEFAULT_CLAWHUB_MARKET_API_URL: &str = "https://clawhub.ai/api/v1/skills";
-const DEFAULT_CLAWHUB_MARKET_API_FALLBACK_URL: &str = "https://wry-manatee-359.convex.site/api/v1/skills";
+const DEFAULT_CLAWHUB_MARKET_API_FALLBACK_URL: &str =
+    "https://wry-manatee-359.convex.site/api/v1/skills";
 const DEFAULT_CLAWHUB_DOWNLOAD_API_URL: &str = "https://clawhub.ai/api/v1/download";
 const DEFAULT_CLAWHUB_DOWNLOAD_API_FALLBACK_URL: &str =
     "https://wry-manatee-359.convex.site/api/v1/download";
@@ -893,7 +895,11 @@ fn parse_clawhub_slug(source: &str) -> Option<String> {
         .unwrap_or_default()
         .trim()
         .to_string();
-    if slug.is_empty() { None } else { Some(slug) }
+    if slug.is_empty() {
+        None
+    } else {
+        Some(slug)
+    }
 }
 
 fn extract_clawhub_zip_secure(zip_bytes: &[u8], dest: &Path) -> Result<()> {

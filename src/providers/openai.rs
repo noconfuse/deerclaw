@@ -3,6 +3,8 @@ use crate::providers::traits::{
     Provider, TokenUsage, ToolCall as ProviderToolCall,
 };
 use crate::tools::ToolSpec;
+use crate::cost::CostTracker;
+use std::sync::Arc;
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -10,6 +12,7 @@ use serde::{Deserialize, Serialize};
 pub struct OpenAiProvider {
     base_url: String,
     credential: Option<String>,
+    cost_tracker: Option<Arc<CostTracker>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -124,6 +127,10 @@ struct NativeFunctionCall {
 
 #[derive(Debug, Deserialize)]
 struct NativeChatResponse {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
     choices: Vec<NativeChoice>,
     #[serde(default)]
     usage: Option<UsageInfo>,
@@ -164,17 +171,22 @@ impl NativeResponseMessage {
 
 impl OpenAiProvider {
     pub fn new(credential: Option<&str>) -> Self {
-        Self::with_base_url(None, credential)
+        Self::with_base_url(None, credential, None)
     }
 
     /// Create a provider with an optional custom base URL.
     /// Defaults to `https://api.openai.com/v1` when `base_url` is `None`.
-    pub fn with_base_url(base_url: Option<&str>, credential: Option<&str>) -> Self {
+    pub fn with_base_url(
+        base_url: Option<&str>,
+        credential: Option<&str>,
+        cost_tracker: Option<Arc<CostTracker>>,
+    ) -> Self {
         Self {
             base_url: base_url
                 .map(|u| u.trim_end_matches('/').to_string())
                 .unwrap_or_else(|| "https://api.openai.com/v1".to_string()),
             credential: credential.map(ToString::to_string),
+            cost_tracker,
         }
     }
 
@@ -394,6 +406,20 @@ impl Provider for OpenAiProvider {
             .ok_or_else(|| anyhow::anyhow!("No response from OpenAI"))?;
         let mut result = Self::parse_native_response(message);
         result.usage = usage;
+
+        if let Some(ref tracker) = self.cost_tracker {
+            if let Some(u) = &result.usage {
+                let actual_model = native_response.model.as_deref().unwrap_or(model);
+                if let Err(e) = tracker.record_usage_with_model(
+                    actual_model,
+                    u.input_tokens.unwrap_or(0),
+                    u.output_tokens.unwrap_or(0),
+                ) {
+                    tracing::warn!("Failed to record cost for {}: {}", actual_model, e);
+                }
+            }
+        }
+
         Ok(result)
     }
 
@@ -457,6 +483,20 @@ impl Provider for OpenAiProvider {
             .ok_or_else(|| anyhow::anyhow!("No response from OpenAI"))?;
         let mut result = Self::parse_native_response(message);
         result.usage = usage;
+
+        if let Some(ref tracker) = self.cost_tracker {
+            if let Some(u) = &result.usage {
+                let actual_model = native_response.model.as_deref().unwrap_or(model);
+                if let Err(e) = tracker.record_usage_with_model(
+                    actual_model,
+                    u.input_tokens.unwrap_or(0),
+                    u.output_tokens.unwrap_or(0),
+                ) {
+                    tracing::warn!("Failed to record cost for {}: {}", actual_model, e);
+                }
+            }
+        }
+
         Ok(result)
     }
 

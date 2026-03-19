@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// Cost tracker for API usage monitoring and budget enforcement.
+#[derive(Debug)]
 pub struct CostTracker {
     config: CostConfig,
     storage: Arc<Mutex<CostStorage>>,
@@ -104,6 +105,37 @@ impl CostTracker {
         }
 
         Ok(BudgetCheck::Allowed)
+    }
+
+    /// Record a usage event by looking up pricing for the given model.
+    pub fn record_usage_with_model(
+        &self,
+        model: &str,
+        input_tokens: u64,
+        output_tokens: u64,
+    ) -> Result<()> {
+        if !self.config.enabled {
+            return Ok(());
+        }
+
+        let price = self.config.prices.get(model).cloned().unwrap_or_else(|| {
+            // Default to 0 cost if model not found
+            tracing::debug!("No pricing found for model {}, assuming zero cost", model);
+            crate::config::schema::ModelPricing {
+                input: 0.0,
+                output: 0.0,
+            }
+        });
+
+        let usage = TokenUsage::new(
+            model,
+            input_tokens,
+            output_tokens,
+            price.input,
+            price.output,
+        );
+
+        self.record_usage(usage)
     }
 
     /// Record a usage event.
@@ -226,6 +258,7 @@ fn build_session_model_stats(session_costs: &[CostRecord]) -> HashMap<String, Mo
 }
 
 /// Persistent storage for cost records.
+#[derive(Debug)]
 struct CostStorage {
     path: PathBuf,
     daily_cost_usd: f64,

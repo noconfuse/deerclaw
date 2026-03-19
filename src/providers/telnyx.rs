@@ -14,9 +14,11 @@
 //! ```
 
 use crate::providers::traits::{ChatMessage, Provider};
+use crate::cost::CostTracker;
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::Deserialize;
+use std::sync::Arc;
 
 /// Telnyx AI inference provider.
 ///
@@ -38,6 +40,7 @@ pub struct TelnyxProvider {
     api_key: Option<String>,
     /// HTTP client for API requests
     client: Client,
+    cost_tracker: Option<Arc<CostTracker>>,
 }
 
 impl TelnyxProvider {
@@ -58,7 +61,13 @@ impl TelnyxProvider {
                 .connect_timeout(std::time::Duration::from_secs(10))
                 .build()
                 .unwrap_or_else(|_| Client::new()),
+            cost_tracker: None,
         }
+    }
+
+    pub fn with_cost_tracker(mut self, cost_tracker: Option<Arc<CostTracker>>) -> Self {
+        self.cost_tracker = cost_tracker;
+        self
     }
 
     /// Create a provider with a custom base URL (for testing or proxies).
@@ -153,6 +162,16 @@ struct Message {
 #[derive(Debug, Deserialize)]
 struct ChatResponse {
     choices: Vec<Choice>,
+    #[serde(default)]
+    usage: Option<UsageInfo>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UsageInfo {
+    #[serde(default)]
+    prompt_tokens: Option<u64>,
+    #[serde(default)]
+    completion_tokens: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -218,6 +237,18 @@ impl Provider for TelnyxProvider {
 
         let chat_response: ChatResponse = response.json().await?;
 
+        if let Some(tracker) = &self.cost_tracker {
+            if let Some(u) = &chat_response.usage {
+                if let Err(e) = tracker.record_usage_with_model(
+                    model,
+                    u.prompt_tokens.unwrap_or(0),
+                    u.completion_tokens.unwrap_or(0),
+                ) {
+                    tracing::warn!("Failed to record cost: {}", e);
+                }
+            }
+        }
+
         chat_response
             .choices
             .into_iter()
@@ -269,6 +300,18 @@ impl Provider for TelnyxProvider {
         }
 
         let chat_response: ChatResponse = response.json().await?;
+
+        if let Some(tracker) = &self.cost_tracker {
+            if let Some(u) = &chat_response.usage {
+                if let Err(e) = tracker.record_usage_with_model(
+                    model,
+                    u.prompt_tokens.unwrap_or(0),
+                    u.completion_tokens.unwrap_or(0),
+                ) {
+                    tracing::warn!("Failed to record cost: {}", e);
+                }
+            }
+        }
 
         chat_response
             .choices

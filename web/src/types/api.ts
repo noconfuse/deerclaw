@@ -138,11 +138,36 @@ export interface SSEEvent {
 }
 
 export interface WsMessage {
-  type: 'message' | 'chunk' | 'tool_call' | 'tool_result' | 'done' | 'error';
+  type: 'message' | 'chunk' | 'tool_call' | 'tool_result' | 'done' | 'error' | 'stopped';
   content?: string;
   full_response?: string;
   name?: string;
   args?: any;
   output?: string;
+  error?: string | null;
   message?: string;
+}
+
+export interface ChatHistoryMessage {
+  role: string;
+  content: string;
+  timestamp: string;
+}
+
+export interface ChatHistoryResponse {
+  messages: ChatHistoryMessage[];
+  offset: number;
+  limit: number;
+  has_more: boolean;
+}
+
+export interface ChatSessionItem {
+  session_id: string;
+  channel: string;
+  sender: string;
+  thread_ts: string | null;
+  last_role: string;
+  last_message: string;
+  last_timestamp: string;
+  message_count: number;
 }

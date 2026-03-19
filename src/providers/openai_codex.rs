@@ -2,12 +2,14 @@ use crate::auth::openai_oauth::extract_account_id_from_jwt;
 use crate::auth::AuthService;
 use crate::multimodal;
 use crate::providers::traits::{ChatMessage, Provider, ProviderCapabilities};
+use crate::providers::CostTracker;
 use crate::providers::ProviderRuntimeOptions;
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 const DEFAULT_CODEX_RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
 const CODEX_RESPONSES_URL_ENV: &str = "ZEROCLAW_CODEX_RESPONSES_URL";
@@ -22,6 +24,7 @@ pub struct OpenAiCodexProvider {
     custom_endpoint: bool,
     gateway_api_key: Option<String>,
     client: Client,
+    cost_tracker: Option<Arc<CostTracker>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -87,6 +90,11 @@ struct ResponsesContent {
 }
 
 impl OpenAiCodexProvider {
+    pub fn with_cost_tracker(mut self, cost_tracker: Option<Arc<CostTracker>>) -> Self {
+        self.cost_tracker = cost_tracker;
+        self
+    }
+
     pub fn new(
         options: &ProviderRuntimeOptions,
         gateway_api_key: Option<&str>,
@@ -104,6 +112,7 @@ impl OpenAiCodexProvider {
             custom_endpoint: !is_default_responses_url(&responses_url),
             responses_url,
             gateway_api_key: gateway_api_key.map(ToString::to_string),
+            cost_tracker: options.cost_tracker.clone(),
             client: Client::builder()
                 .timeout(std::time::Duration::from_secs(120))
                 .connect_timeout(std::time::Duration::from_secs(10))
@@ -505,6 +514,20 @@ impl OpenAiCodexProvider {
         instructions: String,
         model: &str,
     ) -> anyhow::Result<String> {
+        // Estimate input tokens before moving input
+        let mut estimated_input_chars = instructions.len();
+        for inp in &input {
+            for content in &inp.content {
+                if let Some(text) = &content.text {
+                    estimated_input_chars += text.len();
+                }
+                if content.image_url.is_some() {
+                    estimated_input_chars += 4000;
+                }
+            }
+        }
+        let input_tokens = (estimated_input_chars as u64 + 3) / 4;
+
         let use_gateway_api_key_auth = self.custom_endpoint && self.gateway_api_key.is_some();
         let profile = match self
             .auth
@@ -614,7 +637,20 @@ impl OpenAiCodexProvider {
             return Err(super::api_error("OpenAI Codex", response).await);
         }
 
-        decode_responses_body(response).await
+        let response_text = decode_responses_body(response).await?;
+
+        if let Some(ref tracker) = self.cost_tracker {
+            let output_tokens = (response_text.len() as u64 + 3) / 4;
+            if let Err(e) = tracker.record_usage_with_model(
+                model,
+                input_tokens,
+                output_tokens,
+            ) {
+                tracing::warn!("Failed to record cost for {}: {}", model, e);
+            }
+        }
+
+        Ok(response_text)
     }
 }
 
@@ -763,7 +799,11 @@ mod tests {
 
         let options = ProviderRuntimeOptions {
             provider_api_url: Some("https://proxy.example.com/v1".to_string()),
-            ..ProviderRuntimeOptions::default()
+            zeroclaw_dir: None,
+            secrets_encrypt: false,
+            auth_profile_override: None,
+            reasoning_enabled: None,
+            cost_tracker: None,
         };
 
         assert_eq!(
@@ -787,7 +827,11 @@ mod tests {
     fn constructor_enables_custom_endpoint_key_mode() {
         let options = ProviderRuntimeOptions {
             provider_api_url: Some("https://api.tonsof.blue/v1".to_string()),
-            ..ProviderRuntimeOptions::default()
+            zeroclaw_dir: None,
+            secrets_encrypt: false,
+            auth_profile_override: None,
+            reasoning_enabled: None,
+            cost_tracker: None,
         };
 
         let provider = OpenAiCodexProvider::new(&options, Some("test-key")).unwrap();
@@ -1018,6 +1062,7 @@ data: [DONE]
             secrets_encrypt: false,
             auth_profile_override: None,
             reasoning_enabled: None,
+            cost_tracker: None,
         };
         let provider =
             OpenAiCodexProvider::new(&options, None).expect("provider should initialize");

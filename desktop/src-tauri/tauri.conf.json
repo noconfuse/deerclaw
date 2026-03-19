@@ -7,7 +7,7 @@
     "withGlobalTauri": false
   },
   "package": {
-    "productName": "ZeroClaw",
+    "productName": "DeerClaw",
     "version": "0.1.7"
   },
   "tauri": {
@@ -31,7 +31,7 @@
         "icons/icon.icns",
         "icons/icon.ico"
       ],
-      "identifier": "com.zeroclaw.desktop",
+      "identifier": "com.deerclaw.desktop",
       "longDescription": "",
       "macOS": {
         "entitlements": null,
@@ -53,13 +53,18 @@
       "csp": null
     },
     "updater": {
-      "active": false
+      "active": true,
+      "dialog": false,
+      "endpoints": [
+        "https://github.com/zeroclaw-labs/zeroclaw/releases/download/desktop-latest/latest.json"
+      ],
+      "pubkey":"dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDIwNzIyRjQ1Mzg2ODg1QzgKUldUSWhXZzRSUzl5SUtnZ1RvVU9EdGR1SG9WVlMrcG9lRlJiRG5BaFJydUtVQVZsODJFaEhSMXQK"
     },
     "windows": [
       {
         "fullscreen": false,
         "resizable": true,
-        "title": "ZeroClaw",
+        "title": "DeerClaw",
         "width": 1600,
         "height": 1200,
         "url": "http://localhost:42617"

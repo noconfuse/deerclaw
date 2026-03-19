@@ -115,6 +115,13 @@ export default function SkillMarket() {
     return `https://clawhub.ai/skills/${encodeURIComponent(slug)}`;
   };
 
+  const openExternalUrl = (url: string) => {
+    const opened = window.open(url, '_blank', 'noopener,noreferrer');
+    if (!opened) {
+      window.location.assign(url);
+    }
+  };
+
   const openInstallRisk = (item: SkillMarketItem) => {
     setSelectedItem(item);
     setAcknowledgeRisk(false);
@@ -358,8 +365,10 @@ export default function SkillMarket() {
                         {detailUrl ? (
                           <a
                             href={detailUrl}
-                            target="_blank"
-                            rel="noreferrer"
+                            onClick={(event) => {
+                              event.preventDefault();
+                              openExternalUrl(detailUrl);
+                            }}
                             className="inline-flex items-center gap-1 text-xs text-blue-300 hover:text-blue-200"
                           >
                             <ExternalLink className="h-3.5 w-3.5" />
@@ -491,7 +500,7 @@ export default function SkillMarket() {
                         className="inline-flex items-center gap-1 text-xs px-2 py-1 rounded bg-red-600/20 text-red-300 hover:bg-red-600/30 disabled:opacity-50"
                       >
                         <Trash2 className="h-3.5 w-3.5" />
-                        {t('common.delete')}
+                        {t('skill_market.uninstall')}
                       </button>
                     </div>
                   </div>

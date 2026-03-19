@@ -11,7 +11,10 @@ use axum::{
         IntoResponse,
     },
 };
+use parking_lot::Mutex;
 use std::convert::Infallible;
+use std::collections::VecDeque;
+use std::sync::Arc;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 
@@ -37,8 +40,16 @@ pub async fn handle_sse_events(
         }
     }
 
+    let buffered = {
+        let events = state.recent_events.lock();
+        events.iter().cloned().collect::<Vec<_>>()
+    };
+
+    let initial_stream = tokio_stream::iter(buffered.into_iter().map(|value| {
+        Ok::<_, Infallible>(Event::default().data(value.to_string()))
+    }));
     let rx = state.event_tx.subscribe();
-    let stream = BroadcastStream::new(rx).filter_map(
+    let live_stream = BroadcastStream::new(rx).filter_map(
         |result: Result<
             serde_json::Value,
             tokio_stream::wrappers::errors::BroadcastStreamRecvError,
@@ -51,6 +62,7 @@ pub async fn handle_sse_events(
             }
         },
     );
+    let stream = initial_stream.chain(live_stream);
 
     Sse::new(stream)
         .keep_alive(KeepAlive::default())
@@ -61,14 +73,20 @@ pub async fn handle_sse_events(
 pub struct BroadcastObserver {
     inner: Box<dyn crate::observability::Observer>,
     tx: tokio::sync::broadcast::Sender<serde_json::Value>,
+    recent_events: Arc<Mutex<VecDeque<serde_json::Value>>>,
 }
 
 impl BroadcastObserver {
     pub fn new(
         inner: Box<dyn crate::observability::Observer>,
         tx: tokio::sync::broadcast::Sender<serde_json::Value>,
+        recent_events: Arc<Mutex<VecDeque<serde_json::Value>>>,
     ) -> Self {
-        Self { inner, tx }
+        Self {
+            inner,
+            tx,
+            recent_events,
+        }
     }
 }
 
@@ -137,6 +155,13 @@ impl crate::observability::Observer for BroadcastObserver {
             _ => return, // Skip events we don't broadcast
         };
 
+        {
+            let mut events = self.recent_events.lock();
+            if events.len() >= crate::gateway::SSE_EVENT_HISTORY_CAP {
+                events.pop_front();
+            }
+            events.push_back(json.clone());
+        }
         let _ = self.tx.send(json);
     }
 

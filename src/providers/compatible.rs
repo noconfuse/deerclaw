@@ -2,6 +2,7 @@
 //! Most LLM APIs follow the same `/v1/chat/completions` format.
 //! This module provides a single implementation that works for all of them.
 
+use crate::cost::tracker::CostTracker;
 use crate::multimodal;
 use crate::providers::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
@@ -15,6 +16,7 @@ use reqwest::{
     Client,
 };
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 /// A provider that speaks the OpenAI-compatible chat completions API.
 /// Used by: Venice, Vercel AI Gateway, Cloudflare AI Gateway, Moonshot,
@@ -37,6 +39,7 @@ pub struct OpenAiCompatibleProvider {
     /// Whether this provider supports OpenAI-style native tool calling.
     /// When false, tools are injected into the system prompt as text.
     native_tool_calling: bool,
+    cost_tracker: Option<Arc<CostTracker>>,
 }
 
 /// How the provider expects the API key to be sent.
@@ -150,6 +153,11 @@ impl OpenAiCompatibleProvider {
         )
     }
 
+    pub fn with_cost_tracker(mut self, cost_tracker: Option<Arc<CostTracker>>) -> Self {
+        self.cost_tracker = cost_tracker;
+        self
+    }
+
     fn new_with_options(
         name: &str,
         base_url: &str,
@@ -170,6 +178,7 @@ impl OpenAiCompatibleProvider {
             user_agent: user_agent.map(ToString::to_string),
             merge_system_into_user,
             native_tool_calling: !merge_system_into_user,
+            cost_tracker: None,
         }
     }
 
@@ -1207,6 +1216,18 @@ impl Provider for OpenAiCompatibleProvider {
         let body = response.text().await?;
         let chat_response = parse_chat_response_body(&self.name, &body)?;
 
+        if let Some(ref tracker) = self.cost_tracker {
+            if let Some(usage) = &chat_response.usage {
+                if let Err(e) = tracker.record_usage_with_model(
+                    model,
+                    usage.prompt_tokens.unwrap_or(0),
+                    usage.completion_tokens.unwrap_or(0),
+                ) {
+                    tracing::warn!("Failed to record cost for {}: {}", model, e);
+                }
+            }
+        }
+
         chat_response
             .choices
             .into_iter()
@@ -1316,6 +1337,18 @@ impl Provider for OpenAiCompatibleProvider {
         let body = response.text().await?;
         let chat_response = parse_chat_response_body(&self.name, &body)?;
 
+        if let Some(ref tracker) = self.cost_tracker {
+            if let Some(usage) = &chat_response.usage {
+                if let Err(e) = tracker.record_usage_with_model(
+                    model,
+                    usage.prompt_tokens.unwrap_or(0),
+                    usage.completion_tokens.unwrap_or(0),
+                ) {
+                    tracing::warn!("Failed to record cost for {}: {}", model, e);
+                }
+            }
+        }
+
         chat_response
             .choices
             .into_iter()
@@ -1419,6 +1452,19 @@ impl Provider for OpenAiCompatibleProvider {
             input_tokens: u.prompt_tokens,
             output_tokens: u.completion_tokens,
         });
+
+        if let Some(ref tracker) = self.cost_tracker {
+            if let Some(u) = &usage {
+                if let Err(e) = tracker.record_usage_with_model(
+                    model,
+                    u.input_tokens.unwrap_or(0),
+                    u.output_tokens.unwrap_or(0),
+                ) {
+                    tracing::warn!("Failed to record cost for {}: {}", model, e);
+                }
+            }
+        }
+
         let choice = chat_response
             .choices
             .into_iter()
@@ -1562,6 +1608,19 @@ impl Provider for OpenAiCompatibleProvider {
             input_tokens: u.prompt_tokens,
             output_tokens: u.completion_tokens,
         });
+
+        if let Some(ref tracker) = self.cost_tracker {
+            if let Some(u) = &usage {
+                if let Err(e) = tracker.record_usage_with_model(
+                    model,
+                    u.input_tokens.unwrap_or(0),
+                    u.output_tokens.unwrap_or(0),
+                ) {
+                    tracing::warn!("Failed to record cost for {}: {}", model, e);
+                }
+            }
+        }
+
         let message = native_response
             .choices
             .into_iter()

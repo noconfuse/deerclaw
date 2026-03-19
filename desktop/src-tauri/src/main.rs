@@ -3,16 +3,14 @@
     windows_subsystem = "windows"
 )]
 
-use zeroclaw::{Config, daemon};
-use tracing::{info, error};
 use tauri::Manager;
+use tracing::{error, info, warn};
+use zeroclaw::{daemon, Config};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Setup minimal logging for the desktop app wrapper
-    tracing_subscriber::fmt()
-        .with_env_filter("info")
-        .init();
+    tracing_subscriber::fmt().with_env_filter("info").init();
 
     // Install default crypto provider for rustls
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -29,7 +27,10 @@ async fn main() -> anyhow::Result<()> {
         // Use a hash of a known static token for internal desktop use
         // In real pairing, we hash the token. Here we just need ANY entry.
         // Let's use a placeholder.
-        config.gateway.paired_tokens.push("desktop-internal-token".to_string());
+        config
+            .gateway
+            .paired_tokens
+            .push("desktop-internal-token".to_string());
     }
 
     // Force binding to localhost for security since pairing is disabled
@@ -65,7 +66,37 @@ async fn main() -> anyhow::Result<()> {
     tauri::Builder::default()
         .setup(move |app| {
             let main_window = app.get_window("main").unwrap();
+            let update_window = main_window.clone();
             let url = format!("http://localhost:{}", port);
+            let app_handle = app.handle();
+
+            tauri::async_runtime::spawn(async move {
+                match tauri::updater::builder(app_handle.clone()).check().await {
+                    Ok(update) => {
+                        if update.is_update_available() {
+                            let latest_version = update.latest_version().to_string();
+                            info!("update available: {latest_version}");
+                            let should_install = tauri::api::dialog::blocking::ask(
+                                Some(&update_window),
+                                "发现新版本",
+                                format!("检测到新版本 v{latest_version}，是否现在更新并重启应用？"),
+                            );
+                            if should_install {
+                                match update.download_and_install().await {
+                                    Ok(_) => {
+                                        info!("update installed, restarting");
+                                        app_handle.restart();
+                                    }
+                                    Err(err) => error!("failed to install update: {err}"),
+                                }
+                            } else {
+                                info!("user skipped update: {latest_version}");
+                            }
+                        }
+                    }
+                    Err(err) => warn!("update check failed: {err}"),
+                }
+            });
 
             // Wait for a short moment or retry connection?
             // Tauri loads the URL. If it fails, it fails.

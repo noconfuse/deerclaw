@@ -2802,12 +2802,21 @@ pub async fn run(
         .or(config.default_model.as_deref())
         .unwrap_or("anthropic/claude-sonnet-4");
 
+    let cost_tracker = match crate::cost::CostTracker::new(config.cost.clone(), &config.workspace_dir) {
+        Ok(ct) => Some(Arc::new(ct)),
+        Err(e) => {
+            tracing::warn!("Failed to initialize cost tracker: {e}");
+            None
+        }
+    };
+
     let provider_runtime_options = providers::ProviderRuntimeOptions {
         auth_profile_override: None,
         provider_api_url: config.api_url.clone(),
         zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
         secrets_encrypt: config.secrets.encrypt,
         reasoning_enabled: config.runtime.reasoning_enabled,
+        cost_tracker,
     };
 
     let provider: Box<dyn Provider> = providers::create_routed_provider_with_options(
@@ -3260,12 +3269,21 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         .default_model
         .clone()
         .unwrap_or_else(|| "anthropic/claude-sonnet-4-20250514".into());
+    let cost_tracker = match crate::cost::CostTracker::new(config.cost.clone(), &config.workspace_dir) {
+        Ok(ct) => Some(Arc::new(ct)),
+        Err(e) => {
+            tracing::warn!("Failed to initialize cost tracker: {e}");
+            None
+        }
+    };
+
     let provider_runtime_options = providers::ProviderRuntimeOptions {
         auth_profile_override: None,
         provider_api_url: config.api_url.clone(),
         zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
         secrets_encrypt: config.secrets.encrypt,
         reasoning_enabled: config.runtime.reasoning_enabled,
+        cost_tracker,
     };
     let provider: Box<dyn Provider> = providers::create_routed_provider_with_options(
         provider_name,

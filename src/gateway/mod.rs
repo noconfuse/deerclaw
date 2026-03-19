@@ -23,7 +23,7 @@ use crate::runtime;
 use crate::security::pairing::{constant_time_eq, is_public_bind, PairingGuard};
 use crate::security::SecurityPolicy;
 use crate::tools;
-use crate::tools::traits::ToolSpec;
+use crate::tools::traits::{Tool, ToolSpec};
 use crate::util::truncate_with_ellipsis;
 use anyhow::{Context, Result};
 use axum::{
@@ -35,10 +35,11 @@ use axum::{
     Router,
 };
 use parking_lot::Mutex;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio_util::sync::CancellationToken;
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
 use uuid::Uuid;
@@ -53,6 +54,15 @@ pub const RATE_LIMIT_WINDOW_SECS: u64 = 60;
 pub const RATE_LIMIT_MAX_KEYS_DEFAULT: usize = 10_000;
 /// Fallback max distinct idempotency keys retained in gateway memory.
 pub const IDEMPOTENCY_MAX_KEYS_DEFAULT: usize = 10_000;
+pub const ANONYMOUS_SENDER_KEY: &str = "web-local";
+pub const SSE_EVENT_HISTORY_CAP: usize = 200;
+
+pub fn conversation_sender_key(token: Option<&str>) -> String {
+    token
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| ANONYMOUS_SENDER_KEY.to_string())
+}
 
 fn webhook_memory_key() -> String {
     format!("webhook_msg_{}", Uuid::new_v4())
@@ -72,6 +82,71 @@ fn wati_memory_key(msg: &crate::channels::traits::ChannelMessage) -> String {
 
 fn nextcloud_talk_memory_key(msg: &crate::channels::traits::ChannelMessage) -> String {
     format!("nextcloud_talk_{}_{}", msg.sender, msg.id)
+}
+
+pub async fn store_conversation_turn(
+    memory: Arc<dyn Memory>,
+    sender_key: &str,
+    turn: &ChatMessage,
+) -> Result<()> {
+    let payload = serde_json::to_string(turn).context("Failed to serialize chat message")?;
+    let key = format!("chat:{}:{}", sender_key, Uuid::new_v4());
+    memory
+        .store(
+            &key,
+            &payload,
+            MemoryCategory::Conversation,
+            Some(sender_key),
+        )
+        .await
+        .context("Failed to store chat message")?;
+    Ok(())
+}
+
+pub async fn load_conversation_entries(
+    memory: Arc<dyn Memory>,
+    sender_key: &str,
+    limit: usize,
+    offset: usize,
+) -> Result<Vec<(String, ChatMessage)>> {
+    let entries = memory
+        .list_paginated(
+            Some(&MemoryCategory::Conversation),
+            Some(sender_key),
+            limit,
+            offset,
+        )
+        .await
+        .context("Failed to load chat history")?;
+    let mut items = Vec::new();
+    for entry in entries {
+        if let Ok(message) = serde_json::from_str::<ChatMessage>(&entry.content) {
+            items.push((entry.timestamp, message));
+        }
+    }
+    items.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(items)
+}
+
+pub async fn clear_conversation_entries(
+    memory: Arc<dyn Memory>,
+    sender_key: &str,
+) -> Result<usize> {
+    let entries = memory
+        .list(Some(&MemoryCategory::Conversation), Some(sender_key))
+        .await
+        .context("Failed to list chat history")?;
+    let mut deleted = 0usize;
+    for entry in entries {
+        if memory
+            .forget(&entry.key)
+            .await
+            .context("Failed to delete chat history entry")?
+        {
+            deleted += 1;
+        }
+    }
+    Ok(deleted)
 }
 
 fn hash_webhook_secret(value: &str) -> String {
@@ -306,10 +381,33 @@ pub struct AppState {
     pub observer: Arc<dyn crate::observability::Observer>,
     /// Registered tool specs (for web dashboard tools page)
     pub tools_registry: Arc<Vec<ToolSpec>>,
+    /// Runtime tool registry (for executing tool calls)
+    pub tools_registry_runtime: Arc<Vec<Box<dyn Tool>>>,
+    /// Loaded skills for prompt injection
+    pub skills: Arc<Vec<crate::skills::Skill>>,
+    pub non_cli_excluded_tools: Arc<Vec<String>>,
+    pub conversation_histories: Arc<Mutex<HashMap<String, Vec<ChatMessage>>>>,
+    pub cancellation_tokens: Arc<Mutex<HashMap<String, CancellationToken>>>,
     /// Cost tracker (optional, for web dashboard cost page)
     pub cost_tracker: Option<Arc<CostTracker>>,
     /// SSE broadcast channel for real-time events
     pub event_tx: tokio::sync::broadcast::Sender<serde_json::Value>,
+    pub recent_events: Arc<Mutex<VecDeque<serde_json::Value>>>,
+}
+
+impl AppState {
+    pub fn remember_event(&self, event: serde_json::Value) {
+        let mut events = self.recent_events.lock();
+        if events.len() >= SSE_EVENT_HISTORY_CAP {
+            events.pop_front();
+        }
+        events.push_back(event);
+    }
+
+    pub fn emit_event(&self, event: serde_json::Value) {
+        self.remember_event(event.clone());
+        let _ = self.event_tx.send(event);
+    }
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -338,6 +436,15 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     let actual_port = listener.local_addr()?.port();
     let display_addr = format!("{host}:{actual_port}");
 
+    // Cost tracker (optional, but initialized if possible)
+    let cost_tracker = match CostTracker::new(config.cost.clone(), &config.workspace_dir) {
+        Ok(ct) => Some(Arc::new(ct)),
+        Err(e) => {
+            tracing::warn!("Failed to initialize cost tracker: {e}");
+            None
+        }
+    };
+
     let provider: Arc<dyn Provider> = Arc::from(providers::create_resilient_provider_with_options(
         config.default_provider.as_deref().unwrap_or("openrouter"),
         config.api_key.as_deref(),
@@ -349,6 +456,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
             secrets_encrypt: config.secrets.encrypt,
             reasoning_enabled: config.runtime.reasoning_enabled,
+            cost_tracker: cost_tracker.clone(),
         },
     )?);
     let model = config
@@ -378,10 +486,10 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         (None, None)
     };
 
-    let tools_registry_raw = tools::all_tools_with_runtime(
+    let mut tools_list = tools::all_tools_with_runtime(
         Arc::new(config.clone()),
         &security,
-        runtime,
+        runtime.clone(),
         Arc::clone(&mem),
         composio_key,
         composio_entity_id,
@@ -393,24 +501,26 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         config.api_key.as_deref(),
         &config,
     );
-    let tools_registry: Arc<Vec<ToolSpec>> =
-        Arc::new(tools_registry_raw.iter().map(|t| t.spec()).collect());
-
-    // Cost tracker (optional)
-    let cost_tracker = if config.cost.enabled {
-        match CostTracker::new(config.cost.clone(), &config.workspace_dir) {
-            Ok(ct) => Some(Arc::new(ct)),
-            Err(e) => {
-                tracing::warn!("Failed to initialize cost tracker: {e}");
-                None
+    let skills = crate::skills::load_skills_with_config(&config.workspace_dir, &config);
+    for skill in &skills {
+        for tool in &skill.tools {
+            if tool.kind == "shell" {
+                let proxy = crate::skills::adapter::SkillProxyTool::new(
+                    tool.clone(),
+                    runtime.clone(),
+                    security.clone(),
+                );
+                tools_list.push(Box::new(proxy));
             }
         }
-    } else {
-        None
-    };
+    }
+    let tools_registry: Arc<Vec<ToolSpec>> =
+        Arc::new(tools_list.iter().map(|t| t.spec()).collect());
+    let tools_registry_runtime = Arc::new(tools_list);
 
     // SSE broadcast channel for real-time events
     let (event_tx, _event_rx) = tokio::sync::broadcast::channel::<serde_json::Value>(256);
+    let recent_events = Arc::new(Mutex::new(VecDeque::with_capacity(SSE_EVENT_HISTORY_CAP)));
     // Extract webhook secret for authentication
     let webhook_secret_hash: Option<Arc<str>> =
         config.channels_config.webhook.as_ref().and_then(|webhook| {
@@ -620,6 +730,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         Arc::new(sse::BroadcastObserver::new(
             crate::observability::create_observer(&config.observability),
             event_tx.clone(),
+            Arc::clone(&recent_events),
         ));
 
     let state = AppState {
@@ -643,13 +754,20 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         wati: wati_channel,
         observer: broadcast_observer,
         tools_registry,
+        tools_registry_runtime,
+        skills: Arc::new(skills),
+        non_cli_excluded_tools: Arc::new(config.autonomy.non_cli_excluded_tools.clone()),
+        conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+        cancellation_tokens: Arc::new(Mutex::new(HashMap::new())),
         cost_tracker,
         event_tx,
+        recent_events,
     };
 
     // Config PUT needs larger body limit (1MB)
     let config_put_router = Router::new()
         .route("/api/config", put(api::handle_api_config_put))
+        .route("/api/config/form", put(api::handle_api_config_form_put))
         .layer(RequestBodyLimitLayer::new(1_048_576));
 
     // Build router with middleware
@@ -668,12 +786,21 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         // ── Web Dashboard API routes ──
         .route("/api/status", get(api::handle_api_status))
         .route("/api/config", get(api::handle_api_config_get))
+        .route("/api/config/form", get(api::handle_api_config_form_get))
+        .route(
+            "/api/chat/history",
+            get(api::handle_api_chat_history_get).delete(api::handle_api_chat_history_delete),
+        )
+        .route("/api/chat/sessions", get(api::handle_api_chat_sessions))
         .route("/api/tools", get(api::handle_api_tools))
         .route("/api/skills", get(api::handle_api_skills_list))
         .route("/api/skills", post(api::handle_api_skills_install))
         .route("/api/skills/audit", post(api::handle_api_skills_audit))
         .route("/api/skills/{name}", delete(api::handle_api_skills_remove))
-        .route("/api/skills/market", get(api::handle_api_skills_market_list))
+        .route(
+            "/api/skills/market",
+            get(api::handle_api_skills_market_list),
+        )
         .route(
             "/api/skills/market/install",
             post(api::handle_api_skills_market_install),
@@ -1540,6 +1667,7 @@ mod tests {
     use axum::response::IntoResponse;
     use http_body_util::BodyExt;
     use parking_lot::Mutex;
+    use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Generate a random hex secret at runtime to avoid hard-coded cryptographic values.
@@ -1609,8 +1737,14 @@ mod tests {
             wati: None,
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
+            tools_registry_runtime: Arc::new(Vec::new()),
+            skills: Arc::new(Vec::new()),
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            cancellation_tokens: Arc::new(Mutex::new(HashMap::new())),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            recent_events: Arc::new(Mutex::new(VecDeque::new())),
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -1658,8 +1792,14 @@ mod tests {
             wati: None,
             observer,
             tools_registry: Arc::new(Vec::new()),
+            tools_registry_runtime: Arc::new(Vec::new()),
+            skills: Arc::new(Vec::new()),
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            cancellation_tokens: Arc::new(Mutex::new(HashMap::new())),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            recent_events: Arc::new(Mutex::new(VecDeque::new())),
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -2024,8 +2164,14 @@ mod tests {
             wati: None,
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
+            tools_registry_runtime: Arc::new(Vec::new()),
+            skills: Arc::new(Vec::new()),
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            cancellation_tokens: Arc::new(Mutex::new(HashMap::new())),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            recent_events: Arc::new(Mutex::new(VecDeque::new())),
         };
 
         let mut headers = HeaderMap::new();
@@ -2088,8 +2234,14 @@ mod tests {
             wati: None,
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
+            tools_registry_runtime: Arc::new(Vec::new()),
+            skills: Arc::new(Vec::new()),
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            cancellation_tokens: Arc::new(Mutex::new(HashMap::new())),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            recent_events: Arc::new(Mutex::new(VecDeque::new())),
         };
 
         let headers = HeaderMap::new();
@@ -2164,8 +2316,14 @@ mod tests {
             wati: None,
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
+            tools_registry_runtime: Arc::new(Vec::new()),
+            skills: Arc::new(Vec::new()),
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            cancellation_tokens: Arc::new(Mutex::new(HashMap::new())),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            recent_events: Arc::new(Mutex::new(VecDeque::new())),
         };
 
         let response = handle_webhook(
@@ -2212,8 +2370,14 @@ mod tests {
             wati: None,
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
+            tools_registry_runtime: Arc::new(Vec::new()),
+            skills: Arc::new(Vec::new()),
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            cancellation_tokens: Arc::new(Mutex::new(HashMap::new())),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            recent_events: Arc::new(Mutex::new(VecDeque::new())),
         };
 
         let mut headers = HeaderMap::new();
@@ -2265,8 +2429,14 @@ mod tests {
             wati: None,
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
+            tools_registry_runtime: Arc::new(Vec::new()),
+            skills: Arc::new(Vec::new()),
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            cancellation_tokens: Arc::new(Mutex::new(HashMap::new())),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            recent_events: Arc::new(Mutex::new(VecDeque::new())),
         };
 
         let mut headers = HeaderMap::new();
@@ -2323,8 +2493,14 @@ mod tests {
             wati: None,
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
+            tools_registry_runtime: Arc::new(Vec::new()),
+            skills: Arc::new(Vec::new()),
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            cancellation_tokens: Arc::new(Mutex::new(HashMap::new())),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            recent_events: Arc::new(Mutex::new(VecDeque::new())),
         };
 
         let response = handle_nextcloud_talk_webhook(
@@ -2377,8 +2553,14 @@ mod tests {
             wati: None,
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
+            tools_registry_runtime: Arc::new(Vec::new()),
+            skills: Arc::new(Vec::new()),
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            cancellation_tokens: Arc::new(Mutex::new(HashMap::new())),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            recent_events: Arc::new(Mutex::new(VecDeque::new())),
         };
 
         let mut headers = HeaderMap::new();

@@ -12,6 +12,8 @@ import type {
   SkillInstallResult,
   SkillAuditResult,
   SkillMarketItem,
+  ChatHistoryResponse,
+  ChatSessionItem,
 } from '../types/api';
 import { clearToken, getToken, setToken } from './auth';
 
@@ -140,6 +142,17 @@ export function putConfig(toml: string): Promise<void> {
   });
 }
 
+export function getConfigForm<T = Record<string, unknown>>(): Promise<T> {
+  return apiFetch<T>('/api/config/form');
+}
+
+export function putConfigForm<T = Record<string, unknown>>(config: T): Promise<void> {
+  return apiFetch<void>('/api/config/form', {
+    method: 'PUT',
+    body: JSON.stringify(config),
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Tools
 // ---------------------------------------------------------------------------
@@ -148,6 +161,42 @@ export function getTools(): Promise<ToolSpec[]> {
   return apiFetch<ToolSpec[] | { tools: ToolSpec[] }>('/api/tools').then((data) =>
     unwrapField(data, 'tools'),
   );
+}
+
+// ---------------------------------------------------------------------------
+// Chat history
+// ---------------------------------------------------------------------------
+
+export function getChatHistory(params?: {
+  offset?: number;
+  limit?: number;
+  session?: string;
+}): Promise<ChatHistoryResponse> {
+  const search = new URLSearchParams();
+  if (params?.offset !== undefined) {
+    search.set('offset', String(params.offset));
+  }
+  if (params?.limit !== undefined) {
+    search.set('limit', String(params.limit));
+  }
+  if (params?.session) {
+    search.set('session', params.session);
+  }
+  const query = search.toString();
+  const path = query ? `/api/chat/history?${query}` : '/api/chat/history';
+  return apiFetch<ChatHistoryResponse>(path);
+}
+
+export function getChatSessions(): Promise<ChatSessionItem[]> {
+  return apiFetch<ChatSessionItem[] | { sessions: ChatSessionItem[] }>(
+    '/api/chat/sessions',
+  ).then((data) => unwrapField(data, 'sessions'));
+}
+
+export function clearChatHistory(): Promise<{ deleted: number }> {
+  return apiFetch<{ deleted: number }>('/api/chat/history', {
+    method: 'DELETE',
+  });
 }
 
 // ---------------------------------------------------------------------------

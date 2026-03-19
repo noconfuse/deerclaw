@@ -2,12 +2,13 @@
 //! The GLM API requires JWT tokens generated from the `id.secret` API key format
 //! with a custom `sign_type: "SIGN"` header, and uses `/v4/chat/completions`.
 
+use crate::cost::CostTracker;
 use crate::providers::traits::{ChatMessage, Provider};
 use async_trait::async_trait;
 use reqwest::Client;
 use ring::hmac;
 use serde::{Deserialize, Serialize};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub struct GlmProvider {
@@ -16,6 +17,8 @@ pub struct GlmProvider {
     base_url: String,
     /// Cached JWT token + expiry timestamp (ms)
     token_cache: Mutex<Option<(String, u64)>>,
+    client: Client,
+    cost_tracker: Option<Arc<CostTracker>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -34,6 +37,7 @@ struct Message {
 #[derive(Debug, Deserialize)]
 struct ChatResponse {
     choices: Vec<Choice>,
+    usage: Option<crate::cost::types::TokenUsage>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -90,7 +94,14 @@ impl GlmProvider {
             api_key_secret: secret,
             base_url: "https://api.z.ai/api/paas/v4".to_string(),
             token_cache: Mutex::new(None),
+            client: crate::config::build_runtime_proxy_client_with_timeouts("provider.glm", 120, 10),
+            cost_tracker: None,
         }
+    }
+
+    pub fn with_cost_tracker(mut self, cost_tracker: Option<Arc<CostTracker>>) -> Self {
+        self.cost_tracker = cost_tracker;
+        self
     }
 
     fn generate_token(&self) -> anyhow::Result<String> {
@@ -144,8 +155,8 @@ impl GlmProvider {
         Ok(token)
     }
 
-    fn http_client(&self) -> Client {
-        crate::config::build_runtime_proxy_client_with_timeouts("provider.glm", 120, 10)
+    fn http_client(&self) -> &Client {
+        &self.client
     }
 }
 
@@ -197,6 +208,18 @@ impl Provider for GlmProvider {
 
         let chat_response: ChatResponse = response.json().await?;
 
+        if let Some(tracker) = &self.cost_tracker {
+            if let Some(u) = &chat_response.usage {
+                if let Err(e) = tracker.record_usage_with_model(
+                    model,
+                    u.prompt_tokens.unwrap_or(0),
+                    u.completion_tokens.unwrap_or(0),
+                ) {
+                    tracing::warn!("Failed to record cost: {}", e);
+                }
+            }
+        }
+
         chat_response
             .choices
             .into_iter()
@@ -243,6 +266,18 @@ impl Provider for GlmProvider {
         }
 
         let chat_response: ChatResponse = response.json().await?;
+
+        if let Some(tracker) = &self.cost_tracker {
+            if let Some(u) = &chat_response.usage {
+                if let Err(e) = tracker.record_usage_with_model(
+                    model,
+                    u.prompt_tokens.unwrap_or(0),
+                    u.completion_tokens.unwrap_or(0),
+                ) {
+                    tracing::warn!("Failed to record cost: {}", e);
+                }
+            }
+        }
 
         chat_response
             .choices

@@ -231,6 +231,7 @@ pub struct ReliableProvider {
     key_index: AtomicUsize,
     /// Per-model fallback chains: model_name → [fallback_model_1, fallback_model_2, ...]
     model_fallbacks: HashMap<String, Vec<String>>,
+    cost_tracker: Option<std::sync::Arc<crate::cost::CostTracker>>,
 }
 
 impl ReliableProvider {
@@ -246,7 +247,13 @@ impl ReliableProvider {
             api_keys: Vec::new(),
             key_index: AtomicUsize::new(0),
             model_fallbacks: HashMap::new(),
+            cost_tracker: None,
         }
+    }
+
+    pub fn with_cost_tracker(mut self, cost_tracker: Option<std::sync::Arc<crate::cost::CostTracker>>) -> Self {
+        self.cost_tracker = cost_tracker;
+        self
     }
 
     /// Set additional API keys for round-robin rotation on rate-limit errors.

@@ -84,6 +84,26 @@ pub trait Memory: Send + Sync {
         session_id: Option<&str>,
     ) -> anyhow::Result<Vec<MemoryEntry>>;
 
+    /// List memories with pagination, optionally filtered by category and/or session
+    async fn list_paginated(
+        &self,
+        category: Option<&MemoryCategory>,
+        session_id: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut entries = self.list(category, session_id).await?;
+        entries.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        Ok(entries
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .collect::<Vec<_>>())
+    }
+
     /// Remove a memory by key
     async fn forget(&self, key: &str) -> anyhow::Result<bool>;
 

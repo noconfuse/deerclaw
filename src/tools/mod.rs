@@ -325,6 +325,14 @@ pub fn all_tools_with_runtime(
             (!trimmed_value.is_empty()).then(|| trimmed_value.to_owned())
         });
         let parent_tools = Arc::new(tool_arcs.clone());
+        let cost_tracker = match crate::cost::CostTracker::new(root_config.cost.clone(), workspace_dir) {
+            Ok(ct) => Some(Arc::new(ct)),
+            Err(e) => {
+                tracing::warn!("Failed to initialize cost tracker for delegate tool: {e}");
+                None
+            }
+        };
+
         let delegate_tool = DelegateTool::new_with_options(
             delegate_agents,
             delegate_fallback_credential,
@@ -338,6 +346,7 @@ pub fn all_tools_with_runtime(
                     .map(std::path::PathBuf::from),
                 secrets_encrypt: root_config.secrets.encrypt,
                 reasoning_enabled: root_config.runtime.reasoning_enabled,
+                cost_tracker,
             },
         )
         .with_parent_tools(parent_tools)

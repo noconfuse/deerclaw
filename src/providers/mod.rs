@@ -669,6 +669,9 @@ fn zai_base_url(name: &str) -> Option<&'static str> {
     }
 }
 
+use crate::cost::CostTracker;
+use std::sync::Arc;
+
 #[derive(Debug, Clone)]
 pub struct ProviderRuntimeOptions {
     pub auth_profile_override: Option<String>,
@@ -676,6 +679,7 @@ pub struct ProviderRuntimeOptions {
     pub zeroclaw_dir: Option<PathBuf>,
     pub secrets_encrypt: bool,
     pub reasoning_enabled: Option<bool>,
+    pub cost_tracker: Option<Arc<CostTracker>>,
 }
 
 impl Default for ProviderRuntimeOptions {
@@ -686,6 +690,7 @@ impl Default for ProviderRuntimeOptions {
             zeroclaw_dir: None,
             secrets_encrypt: true,
             reasoning_enabled: None,
+            cost_tracker: None,
         }
     }
 }
@@ -968,15 +973,20 @@ fn create_provider_with_url_and_options(
             )?))
         }
         // ── Primary providers (custom implementations) ───────
-        "openrouter" => Ok(Box::new(openrouter::OpenRouterProvider::new(key))),
-        "anthropic" => Ok(Box::new(anthropic::AnthropicProvider::new(key))),
-        "openai" => Ok(Box::new(openai::OpenAiProvider::with_base_url(api_url, key))),
+        "openrouter" => Ok(Box::new(openrouter::OpenRouterProvider::new(key)
+            .with_cost_tracker(options.cost_tracker.clone()))),
+        "anthropic" => Ok(Box::new(anthropic::AnthropicProvider::new(key).with_cost_tracker(options.cost_tracker.clone()))),
+        "openai" => Ok(Box::new(openai::OpenAiProvider::with_base_url(
+            api_url,
+            key,
+            options.cost_tracker.clone(),
+        ))),
         // Ollama uses api_url for custom base URL (e.g. remote Ollama instance)
         "ollama" => Ok(Box::new(ollama::OllamaProvider::new_with_reasoning(
             api_url,
             key,
             options.reasoning_enabled,
-        ))),
+        ).with_cost_tracker(options.cost_tracker.clone()))),
         "gemini" | "google" | "google-gemini" => {
             let state_dir = options
                 .zeroclaw_dir
@@ -992,32 +1002,33 @@ fn create_provider_with_url_and_options(
                 key,
                 auth_service,
                 options.auth_profile_override.clone(),
-            )))
+            ).with_cost_tracker(options.cost_tracker.clone())))
         }
-        "telnyx" => Ok(Box::new(telnyx::TelnyxProvider::new(key))),
+        "telnyx" => Ok(Box::new(telnyx::TelnyxProvider::new(key)
+            .with_cost_tracker(options.cost_tracker.clone()))),
 
         // ── OpenAI-compatible providers ──────────────────────
         "venice" => Ok(Box::new(OpenAiCompatibleProvider::new(
             "Venice", "https://api.venice.ai", key, AuthStyle::Bearer,
-        ))),
+        ).with_cost_tracker(options.cost_tracker.clone()))),
         "vercel" | "vercel-ai" => Ok(Box::new(OpenAiCompatibleProvider::new(
             "Vercel AI Gateway",
             VERCEL_AI_GATEWAY_BASE_URL,
             key,
             AuthStyle::Bearer,
-        ))),
+        ).with_cost_tracker(options.cost_tracker.clone()))),
         "cloudflare" | "cloudflare-ai" => Ok(Box::new(OpenAiCompatibleProvider::new(
             "Cloudflare AI Gateway",
             "https://gateway.ai.cloudflare.com/v1",
             key,
             AuthStyle::Bearer,
-        ))),
+        ).with_cost_tracker(options.cost_tracker.clone()))),
         name if moonshot_base_url(name).is_some() => Ok(Box::new(OpenAiCompatibleProvider::new(
             "Moonshot",
             moonshot_base_url(name).expect("checked in guard"),
             key,
             AuthStyle::Bearer,
-        ))),
+        ).with_cost_tracker(options.cost_tracker.clone()))),
         "kimi-code" | "kimi_coding" | "kimi_for_coding" => Ok(Box::new(
             OpenAiCompatibleProvider::new_with_user_agent(
                 "Kimi Code",
@@ -1025,27 +1036,27 @@ fn create_provider_with_url_and_options(
                 key,
                 AuthStyle::Bearer,
                 "KimiCLI/0.77",
-            ),
+            ).with_cost_tracker(options.cost_tracker.clone()),
         )),
         "synthetic" => Ok(Box::new(OpenAiCompatibleProvider::new(
             "Synthetic", "https://api.synthetic.new/openai/v1", key, AuthStyle::Bearer,
-        ))),
+        ).with_cost_tracker(options.cost_tracker.clone()))),
         "opencode" | "opencode-zen" => Ok(Box::new(OpenAiCompatibleProvider::new(
             "OpenCode Zen", "https://opencode.ai/zen/v1", key, AuthStyle::Bearer,
-        ))),
+        ).with_cost_tracker(options.cost_tracker.clone()))),
         name if zai_base_url(name).is_some() => Ok(Box::new(OpenAiCompatibleProvider::new(
             "Z.AI",
             zai_base_url(name).expect("checked in guard"),
             key,
             AuthStyle::Bearer,
-        ))),
+        ).with_cost_tracker(options.cost_tracker.clone()))),
         name if glm_base_url(name).is_some() => {
             Ok(Box::new(OpenAiCompatibleProvider::new_no_responses_fallback(
                 "GLM",
                 glm_base_url(name).expect("checked in guard"),
                 key,
                 AuthStyle::Bearer,
-            )))
+            ).with_cost_tracker(options.cost_tracker.clone())))
         }
         name if minimax_base_url(name).is_some() => Ok(Box::new(
             OpenAiCompatibleProvider::new_merge_system_into_user(
@@ -1053,9 +1064,9 @@ fn create_provider_with_url_and_options(
                 minimax_base_url(name).expect("checked in guard"),
                 key,
                 AuthStyle::Bearer,
-            )
+            ).with_cost_tracker(options.cost_tracker.clone())
         )),
-        "bedrock" | "aws-bedrock" => Ok(Box::new(bedrock::BedrockProvider::new())),
+        "bedrock" | "aws-bedrock" => Ok(Box::new(bedrock::BedrockProvider::new().with_cost_tracker(options.cost_tracker.clone()))),
         name if is_qwen_oauth_alias(name) => {
             let base_url = api_url
                 .map(str::trim)
@@ -1072,54 +1083,55 @@ fn create_provider_with_url_and_options(
                 AuthStyle::Bearer,
                 "QwenCode/1.0",
                 true,
-            )))
+            ).with_cost_tracker(options.cost_tracker.clone())))
         }
         name if is_qianfan_alias(name) => Ok(Box::new(OpenAiCompatibleProvider::new(
             "Qianfan", "https://aip.baidubce.com", key, AuthStyle::Bearer,
-        ))),
+        ).with_cost_tracker(options.cost_tracker.clone()))),
         name if is_doubao_alias(name) => Ok(Box::new(OpenAiCompatibleProvider::new(
             "Doubao",
             "https://ark.cn-beijing.volces.com/api/v3",
             key,
             AuthStyle::Bearer,
-        ))),
+        ).with_cost_tracker(options.cost_tracker.clone()))),
         name if qwen_base_url(name).is_some() => Ok(Box::new(OpenAiCompatibleProvider::new_with_vision(
             "Qwen",
             qwen_base_url(name).expect("checked in guard"),
             key,
             AuthStyle::Bearer,
             true,
-        ))),
+        ).with_cost_tracker(options.cost_tracker.clone()))),
 
         // ── Extended ecosystem (community favorites) ─────────
         "groq" => Ok(Box::new(OpenAiCompatibleProvider::new(
             "Groq", "https://api.groq.com/openai/v1", key, AuthStyle::Bearer,
-        ))),
+        ).with_cost_tracker(options.cost_tracker.clone()))),
         "mistral" => Ok(Box::new(OpenAiCompatibleProvider::new(
             "Mistral", "https://api.mistral.ai/v1", key, AuthStyle::Bearer,
-        ))),
+        ).with_cost_tracker(options.cost_tracker.clone()))),
         "xai" | "grok" => Ok(Box::new(OpenAiCompatibleProvider::new(
             "xAI", "https://api.x.ai", key, AuthStyle::Bearer,
-        ))),
+        ).with_cost_tracker(options.cost_tracker.clone()))),
         "deepseek" => Ok(Box::new(OpenAiCompatibleProvider::new(
             "DeepSeek", "https://api.deepseek.com", key, AuthStyle::Bearer,
-        ))),
+        ).with_cost_tracker(options.cost_tracker.clone()))),
         "together" | "together-ai" => Ok(Box::new(OpenAiCompatibleProvider::new(
             "Together AI", "https://api.together.xyz", key, AuthStyle::Bearer,
-        ))),
+        ).with_cost_tracker(options.cost_tracker.clone()))),
         "fireworks" | "fireworks-ai" => Ok(Box::new(OpenAiCompatibleProvider::new(
             "Fireworks AI", "https://api.fireworks.ai/inference/v1", key, AuthStyle::Bearer,
-        ))),
+        ).with_cost_tracker(options.cost_tracker.clone()))),
         "novita" => Ok(Box::new(OpenAiCompatibleProvider::new(
             "Novita AI", "https://api.novita.ai/openai", key, AuthStyle::Bearer,
-        ))),
+        ).with_cost_tracker(options.cost_tracker.clone()))),
         "perplexity" => Ok(Box::new(OpenAiCompatibleProvider::new(
             "Perplexity", "https://api.perplexity.ai", key, AuthStyle::Bearer,
-        ))),
+        ).with_cost_tracker(options.cost_tracker.clone()))),
         "cohere" => Ok(Box::new(OpenAiCompatibleProvider::new(
             "Cohere", "https://api.cohere.com/compatibility", key, AuthStyle::Bearer,
-        ))),
-        "copilot" | "github-copilot" => Ok(Box::new(copilot::CopilotProvider::new(key))),
+        ).with_cost_tracker(options.cost_tracker.clone()))),
+        "copilot" | "github-copilot" => Ok(Box::new(copilot::CopilotProvider::new(key)
+            .with_cost_tracker(options.cost_tracker.clone()))),
         "lmstudio" | "lm-studio" => {
             let lm_studio_key = key
                 .map(str::trim)
@@ -1130,7 +1142,7 @@ fn create_provider_with_url_and_options(
                 "http://localhost:1234/v1",
                 Some(lm_studio_key),
                 AuthStyle::Bearer,
-            )))
+            ).with_cost_tracker(options.cost_tracker.clone())))
         }
         "llamacpp" | "llama.cpp" => {
             let base_url = api_url
@@ -1146,7 +1158,7 @@ fn create_provider_with_url_and_options(
                 base_url,
                 Some(llama_cpp_key),
                 AuthStyle::Bearer,
-            )))
+            ).with_cost_tracker(options.cost_tracker.clone())))
         }
         "sglang" => {
             let base_url = api_url
@@ -1158,7 +1170,7 @@ fn create_provider_with_url_and_options(
                 base_url,
                 key,
                 AuthStyle::Bearer,
-            )))
+            ).with_cost_tracker(options.cost_tracker.clone())))
         }
         "vllm" => {
             let base_url = api_url
@@ -1170,7 +1182,7 @@ fn create_provider_with_url_and_options(
                 base_url,
                 key,
                 AuthStyle::Bearer,
-            )))
+            ).with_cost_tracker(options.cost_tracker.clone())))
         }
         "osaurus" => {
             let base_url = api_url
@@ -1186,7 +1198,7 @@ fn create_provider_with_url_and_options(
                 base_url,
                 Some(osaurus_key),
                 AuthStyle::Bearer,
-            )))
+            ).with_cost_tracker(options.cost_tracker.clone())))
         }
         "nvidia" | "nvidia-nim" | "build.nvidia.com" => Ok(Box::new(
             OpenAiCompatibleProvider::new_no_responses_fallback(
@@ -1194,18 +1206,19 @@ fn create_provider_with_url_and_options(
                 "https://integrate.api.nvidia.com/v1",
                 key,
                 AuthStyle::Bearer,
-            ),
+            ).with_cost_tracker(options.cost_tracker.clone()),
         )),
 
         // ── AI inference routers ─────────────────────────────
         "astrai" => Ok(Box::new(OpenAiCompatibleProvider::new(
             "Astrai", "https://as-trai.com/v1", key, AuthStyle::Bearer,
-        ))),
+        ).with_cost_tracker(options.cost_tracker.clone()))),
 
         // ── Cloud AI endpoints ───────────────────────────────
         "ovhcloud" | "ovh" => Ok(Box::new(openai::OpenAiProvider::with_base_url(
             Some("https://oai.endpoints.kepler.ai.cloud.ovh.net/v1"),
             key,
+            options.cost_tracker.clone(),
         ))),
 
         // ── Bring Your Own Provider (custom URL) ───────────
@@ -1222,7 +1235,7 @@ fn create_provider_with_url_and_options(
                 key,
                 AuthStyle::Bearer,
                 true,
-            )))
+            ).with_cost_tracker(options.cost_tracker.clone())))
         }
 
         // ── Anthropic-compatible custom endpoints ───────────
@@ -1236,7 +1249,7 @@ fn create_provider_with_url_and_options(
             Ok(Box::new(anthropic::AnthropicProvider::with_base_url(
                 key,
                 Some(&base_url),
-            )))
+            ).with_cost_tracker(options.cost_tracker.clone())))
         }
 
         _ => anyhow::bail!(
@@ -1338,6 +1351,7 @@ pub fn create_resilient_provider_with_options(
         reliability.provider_retries,
         reliability.provider_backoff_ms,
     )
+    .with_cost_tracker(options.cost_tracker.clone())
     .with_api_keys(reliability.api_keys.clone())
     .with_model_fallbacks(reliability.model_fallbacks.clone());
 
@@ -1441,7 +1455,7 @@ pub fn create_routed_provider_with_options(
         providers,
         routes,
         default_model.to_string(),
-    )))
+    ).with_cost_tracker(options.cost_tracker.clone())))
 }
 
 /// Information about a supported provider for display purposes.

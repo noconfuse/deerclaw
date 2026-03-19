@@ -2,14 +2,19 @@
 //!
 //! All `/api/*` routes require bearer token authentication (PairingGuard).
 
-use super::AppState;
+use super::{
+    clear_conversation_entries, conversation_sender_key, load_conversation_entries, AppState,
+};
+use crate::providers::ChatMessage;
 use anyhow::Result;
 use axum::{
     extract::{Path, Query, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Json},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::fs;
 use std::io::Write;
 use std::path::Path as StdPath;
@@ -54,6 +59,25 @@ fn require_auth(
 pub struct MemoryQuery {
     pub query: Option<String>,
     pub category: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct ChatHistoryQuery {
+    pub offset: Option<usize>,
+    pub limit: Option<usize>,
+    pub session: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct ChatSessionItem {
+    pub session_id: String,
+    pub channel: String,
+    pub sender: String,
+    pub thread_ts: Option<String>,
+    pub last_role: String,
+    pub last_message: String,
+    pub last_timestamp: String,
+    pub message_count: usize,
 }
 
 #[derive(Deserialize)]
@@ -153,6 +177,189 @@ pub async fn handle_api_config_get(
     .into_response()
 }
 
+/// GET /api/config/form — current config (JSON, api_key masked)
+pub async fn handle_api_config_form_get(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let config = state.config.lock().clone();
+    let masked_config = mask_sensitive_fields(&config);
+    Json(masked_config).into_response()
+}
+
+/// GET /api/chat/history — conversation history for current session
+pub async fn handle_api_chat_history_get(
+    State(state): State<AppState>,
+    Query(params): Query<ChatHistoryQuery>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let token = extract_bearer_token(&headers);
+    let sender_key = params
+        .session
+        .clone()
+        .unwrap_or_else(|| conversation_sender_key(token));
+    let offset = params.offset.unwrap_or(0);
+    let limit = params.limit.unwrap_or(50).clamp(1, 200);
+    let fetch_limit = limit.saturating_add(1);
+    let items = load_conversation_entries(state.mem.clone(), &sender_key, fetch_limit, offset)
+        .await
+        .unwrap_or_default();
+    let has_more = items.len() > limit;
+    let messages = items
+        .into_iter()
+        .take(limit)
+        .map(|(timestamp, msg)| {
+            serde_json::json!({
+                "role": msg.role,
+                "content": msg.content,
+                "timestamp": timestamp,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    Json(serde_json::json!({
+        "messages": messages,
+        "offset": offset,
+        "limit": limit,
+        "has_more": has_more,
+    }))
+    .into_response()
+}
+
+fn parse_channel_session_id(session_id: &str) -> Option<(String, String, Option<String>)> {
+    let mut parts = session_id.split(':');
+    if parts.next()? != "channel" {
+        return None;
+    }
+    let channel = parts.next()?.to_string();
+    let sender = parts.next()?.to_string();
+    let remainder: Vec<&str> = parts.collect();
+    let thread_ts = if remainder.is_empty() {
+        None
+    } else {
+        Some(remainder.join(":"))
+    };
+    Some((channel, sender, thread_ts))
+}
+
+/// GET /api/chat/sessions — list channel conversation sessions
+pub async fn handle_api_chat_sessions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let entries = match state
+        .mem
+        .list(Some(&crate::memory::MemoryCategory::Conversation), None)
+        .await
+    {
+        Ok(items) => items,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("Memory list failed: {e}")})),
+            )
+                .into_response();
+        }
+    };
+
+    #[derive(Default)]
+    struct SessionAgg {
+        channel: String,
+        sender: String,
+        thread_ts: Option<String>,
+        last_role: String,
+        last_message: String,
+        last_timestamp: String,
+        message_count: usize,
+    }
+
+    let mut sessions: HashMap<String, SessionAgg> = HashMap::new();
+    for entry in entries {
+        let Some(session_id) = entry.session_id.as_deref() else {
+            continue;
+        };
+        let Some((channel, sender, thread_ts)) = parse_channel_session_id(session_id) else {
+            continue;
+        };
+        let (last_role, last_message) = match serde_json::from_str::<ChatMessage>(&entry.content) {
+            Ok(msg) => (msg.role, msg.content),
+            Err(_) => ("unknown".to_string(), entry.content.clone()),
+        };
+
+        let session_key = session_id.to_string();
+        let agg = match sessions.entry(session_key) {
+            Entry::Vacant(slot) => slot.insert(SessionAgg {
+                channel,
+                sender,
+                thread_ts,
+                last_role: last_role.clone(),
+                last_message: last_message.clone(),
+                last_timestamp: entry.timestamp.clone(),
+                message_count: 0,
+            }),
+            Entry::Occupied(slot) => slot.into_mut(),
+        };
+
+        agg.message_count += 1;
+        if entry.timestamp >= agg.last_timestamp {
+            agg.last_timestamp = entry.timestamp.clone();
+            agg.last_role = last_role;
+            agg.last_message = last_message;
+        }
+    }
+
+    let mut items = sessions
+        .into_iter()
+        .map(|(session_id, agg)| ChatSessionItem {
+            session_id,
+            channel: agg.channel,
+            sender: agg.sender,
+            thread_ts: agg.thread_ts,
+            last_role: agg.last_role,
+            last_message: agg.last_message,
+            last_timestamp: agg.last_timestamp,
+            message_count: agg.message_count,
+        })
+        .collect::<Vec<_>>();
+
+    items.sort_by(|a, b| b.last_timestamp.cmp(&a.last_timestamp));
+
+    Json(serde_json::json!({ "sessions": items })).into_response()
+}
+
+/// DELETE /api/chat/history — clear conversation history for current session
+pub async fn handle_api_chat_history_delete(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let token = extract_bearer_token(&headers);
+    let sender_key = conversation_sender_key(token);
+    let deleted = clear_conversation_entries(state.mem.clone(), &sender_key)
+        .await
+        .unwrap_or(0);
+
+    Json(serde_json::json!({
+        "deleted": deleted,
+    }))
+    .into_response()
+}
+
 /// PUT /api/config — update config from TOML body
 pub async fn handle_api_config_put(
     State(state): State<AppState>,
@@ -196,6 +403,40 @@ pub async fn handle_api_config_put(
     }
 
     // Update in-memory config
+    *state.config.lock() = new_config;
+
+    Json(serde_json::json!({"status": "ok"})).into_response()
+}
+
+/// PUT /api/config/form — update config from JSON body
+pub async fn handle_api_config_form_put(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(incoming): Json<crate::config::Config>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let current_config = state.config.lock().clone();
+    let new_config = hydrate_config_for_save(incoming, &current_config);
+
+    if let Err(e) = new_config.validate() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": format!("Invalid config: {e}")})),
+        )
+            .into_response();
+    }
+
+    if let Err(e) = new_config.save().await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to save config: {e}")})),
+        )
+            .into_response();
+    }
+
     *state.config.lock() = new_config;
 
     Json(serde_json::json!({"status": "ok"})).into_response()
@@ -275,16 +516,17 @@ pub async fn handle_api_skills_install(
     let config = state.config.lock().clone();
     let workspace_dir = config.workspace_dir.clone();
     let source = source.to_string();
-    let install_result = tokio::task::spawn_blocking(move || {
-        crate::skills::install_skill(&workspace_dir, &source)
-    })
-    .await;
+    let install_result =
+        tokio::task::spawn_blocking(move || crate::skills::install_skill(&workspace_dir, &source))
+            .await;
     let install_result = match install_result {
         Ok(result) => result,
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": format!("Failed to run skill install task: {e}")})),
+                Json(
+                    serde_json::json!({"error": format!("Failed to run skill install task: {e}")}),
+                ),
             )
                 .into_response();
         }
@@ -1271,9 +1513,7 @@ pub struct OnboardInitBody {
 }
 
 /// GET /api/onboard — check if system is configured
-pub async fn handle_api_onboard_status(
-    State(state): State<AppState>,
-) -> impl IntoResponse {
+pub async fn handle_api_onboard_status(State(state): State<AppState>) -> impl IntoResponse {
     let config = state.config.lock().clone();
     Json(serde_json::json!({
         "configured": config.is_configured()
@@ -1288,10 +1528,11 @@ pub async fn handle_api_onboard_init(
     let mut config = state.config.lock().clone();
 
     if config.is_configured() {
-         return (
+        return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({"error": "Already configured"})),
-        ).into_response();
+        )
+            .into_response();
     }
 
     // Update config
@@ -1366,11 +1607,12 @@ pub async fn handle_api_onboard_init(
             match provider.as_str() {
                 "cloudflare" => {
                     if let Some(token) = body.tunnel_cloudflare_token {
-                        config.tunnel.cloudflare = Some(crate::config::schema::CloudflareTunnelConfig { token });
+                        config.tunnel.cloudflare =
+                            Some(crate::config::schema::CloudflareTunnelConfig { token });
                     }
                 }
                 "tailscale" => {
-                     config.tunnel.tailscale = Some(crate::config::schema::TailscaleTunnelConfig {
+                    config.tunnel.tailscale = Some(crate::config::schema::TailscaleTunnelConfig {
                         funnel: body.tunnel_tailscale_funnel.unwrap_or(false),
                         hostname: None,
                     });
@@ -1479,11 +1721,14 @@ pub async fn handle_api_onboard_init(
             user_name,
             comm_style,
             timezone,
-        ).await {
-             return (
+        )
+        .await
+        {
+            return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": format!("Failed to scaffold workspace: {e}")})),
-            ).into_response();
+            )
+                .into_response();
         }
     }
 
@@ -1656,8 +1901,14 @@ async fn scaffold_workspace(
     write_if_missing(&workspace_dir.join("SOUL.md"), &soul)?;
     write_if_missing(&workspace_dir.join("USER.md"), &user_md)?;
     write_if_missing(&workspace_dir.join("BOOTSTRAP.md"), &bootstrap)?;
-    write_if_missing(&workspace_dir.join("MEMORY.md"), "# MEMORY.md\n\nKey long-term memories go here.\n")?;
-    write_if_missing(&workspace_dir.join("TOOLS.md"), "# TOOLS.md\n\nTool-specific notes and configurations go here.\n")?;
+    write_if_missing(
+        &workspace_dir.join("MEMORY.md"),
+        "# MEMORY.md\n\nKey long-term memories go here.\n",
+    )?;
+    write_if_missing(
+        &workspace_dir.join("TOOLS.md"),
+        "# TOOLS.md\n\nTool-specific notes and configurations go here.\n",
+    )?;
 
     fs::create_dir_all(workspace_dir.join("memory"))?;
 

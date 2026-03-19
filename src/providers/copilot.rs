@@ -11,6 +11,7 @@
 //! GitHub could change or revoke this at any time, which would break all
 //! third-party integrations simultaneously.
 
+use crate::cost::CostTracker;
 use crate::providers::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
     Provider, TokenUsage, ToolCall as ProviderToolCall,
@@ -172,6 +173,7 @@ pub struct CopilotProvider {
     /// preventing duplicate device flow prompts or redundant API calls.
     refresh_lock: Arc<Mutex<Option<CachedApiKey>>>,
     token_dir: PathBuf,
+    cost_tracker: Option<Arc<CostTracker>>,
 }
 
 impl CopilotProvider {
@@ -214,7 +216,13 @@ impl CopilotProvider {
                 .map(String::from),
             refresh_lock: Arc::new(Mutex::new(None)),
             token_dir,
+            cost_tracker: None,
         }
+    }
+
+    pub fn with_cost_tracker(mut self, cost_tracker: Option<Arc<CostTracker>>) -> Self {
+        self.cost_tracker = cost_tracker;
+        self
     }
 
     fn http_client(&self) -> Client {
@@ -354,6 +362,19 @@ impl CopilotProvider {
             input_tokens: u.prompt_tokens,
             output_tokens: u.completion_tokens,
         });
+
+        if let Some(tracker) = &self.cost_tracker {
+            if let Some(u) = &usage {
+                if let Err(e) = tracker.record_usage_with_model(
+                    model,
+                    u.input_tokens.unwrap_or(0),
+                    u.output_tokens.unwrap_or(0),
+                ) {
+                    tracing::warn!("Failed to record cost for {}: {}", model, e);
+                }
+            }
+        }
+
         let choice = api_response
             .choices
             .into_iter()

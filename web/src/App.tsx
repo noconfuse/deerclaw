@@ -17,6 +17,7 @@ import Onboard from './pages/Onboard';
 import { AuthProvider, useAuth } from './hooks/useAuth';
 import { setLocale, type Locale } from './lib/i18n';
 import { getOnboardStatus } from './lib/api';
+import { Logo } from './components/ui/Logo';
 
 // Locale context
 interface LocaleContextType {
@@ -55,6 +56,9 @@ function PairingDialog({ onPair }: { onPair: (code: string) => Promise<void> }) 
     <div className="min-h-screen bg-gray-950 flex items-center justify-center">
       <div className="bg-gray-900 rounded-xl p-8 w-full max-w-md border border-gray-800">
         <div className="text-center mb-6">
+          <div className="flex justify-center mb-4">
+            <Logo className="h-16 w-16" />
+          </div>
           <h1 className="text-2xl font-bold text-white mb-2">DeerClaw</h1>
           <p className="text-gray-400">{t('auth.enter_code')}</p>
         </div>

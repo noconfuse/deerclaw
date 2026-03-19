@@ -6,6 +6,7 @@
 
 use crate::auth::AuthService;
 use crate::providers::traits::{ChatMessage, ChatResponse, Provider, TokenUsage};
+use crate::cost::CostTracker;
 use async_trait::async_trait;
 use base64::Engine;
 use directories::UserDirs;
@@ -24,6 +25,7 @@ pub struct GeminiProvider {
     auth_service: Option<AuthService>,
     /// Override profile name for managed auth.
     auth_profile_override: Option<String>,
+    cost_tracker: Option<Arc<CostTracker>>,
 }
 
 /// Mutable OAuth token state — supports runtime refresh for long-lived processes.
@@ -449,6 +451,7 @@ impl GeminiProvider {
             oauth_index: Arc::new(tokio::sync::Mutex::new(0)),
             auth_service: None,
             auth_profile_override: None,
+            cost_tracker: None,
         }
     }
 
@@ -522,7 +525,13 @@ impl GeminiProvider {
                 None
             },
             auth_profile_override: profile_override,
+            cost_tracker: None,
         }
+    }
+
+    pub fn with_cost_tracker(mut self, cost_tracker: Option<Arc<CostTracker>>) -> Self {
+        self.cost_tracker = cost_tracker;
+        self
     }
 
     fn normalize_non_empty(value: &str) -> Option<String> {
@@ -1125,10 +1134,22 @@ impl GeminiProvider {
             anyhow::bail!("Gemini API error: {}", err.message);
         }
 
-        let usage = result.usage_metadata.map(|u| TokenUsage {
+        let usage = result.usage_metadata.as_ref().map(|u| TokenUsage {
             input_tokens: u.prompt_token_count,
             output_tokens: u.candidates_token_count,
         });
+
+        if let Some(ref tracker) = self.cost_tracker {
+            if let Some(usage_meta) = &result.usage_metadata {
+                if let Err(e) = tracker.record_usage_with_model(
+                    model,
+                    usage_meta.prompt_token_count.unwrap_or(0),
+                    usage_meta.candidates_token_count.unwrap_or(0),
+                ) {
+                    tracing::warn!("Failed to record cost for {}: {}", model, e);
+                }
+            }
+        }
 
         let text = result
             .candidates
@@ -1348,6 +1369,7 @@ mod tests {
             oauth_index: Arc::new(tokio::sync::Mutex::new(0)),
             auth_service: None,
             auth_profile_override: None,
+            cost_tracker: None,
         }
     }
 
@@ -2121,6 +2143,7 @@ mod tests {
             oauth_index: Arc::new(tokio::sync::Mutex::new(0)),
             auth_service: None, // Missing auth_service
             auth_profile_override: None,
+            cost_tracker: None,
         };
 
         let result = provider.warmup().await;

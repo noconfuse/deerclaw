@@ -3,13 +3,16 @@ use crate::providers::traits::{
     Provider, TokenUsage, ToolCall as ProviderToolCall,
 };
 use crate::tools::ToolSpec;
+use crate::cost::tracker::CostTracker;
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 pub struct AnthropicProvider {
     credential: Option<String>,
     base_url: String,
+    cost_tracker: Option<Arc<CostTracker>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -170,7 +173,13 @@ impl AnthropicProvider {
                 .filter(|k| !k.is_empty())
                 .map(ToString::to_string),
             base_url,
+            cost_tracker: None,
         }
+    }
+
+    pub fn with_cost_tracker(mut self, cost_tracker: Option<Arc<CostTracker>>) -> Self {
+        self.cost_tracker = cost_tracker;
+        self
     }
 
     fn is_setup_token(token: &str) -> bool {
@@ -507,6 +516,19 @@ impl Provider for AnthropicProvider {
         }
 
         let native_response: NativeChatResponse = response.json().await?;
+
+        if let Some(ref tracker) = self.cost_tracker {
+            if let Some(usage) = &native_response.usage {
+                if let Err(e) = tracker.record_usage_with_model(
+                    model,
+                    usage.input_tokens.unwrap_or(0),
+                    usage.output_tokens.unwrap_or(0),
+                ) {
+                    tracing::warn!("Failed to record cost for {}: {}", model, e);
+                }
+            }
+        }
+
         Ok(Self::parse_native_response(native_response))
     }
 
@@ -1245,6 +1267,7 @@ mod tests {
         let provider = AnthropicProvider {
             credential: Some("test-key".to_string()),
             base_url: format!("http://{addr}"),
+            cost_tracker: None,
         };
 
         // Multi-turn conversation: system → user (Go code) → assistant (code response) → user (follow-up)
