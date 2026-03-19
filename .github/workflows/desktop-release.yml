@@ -1,11 +1,20 @@
 name: Desktop Release
 
 on:
+  push:
+    branches: [master]
+    paths:
+      - "desktop/**"
+      - "web/**"
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/desktop-release.yml"
   workflow_dispatch:
     inputs:
       version:
         description: "Desktop version (e.g. 0.1.8)"
-        required: true
+        required: false
         type: string
 
 permissions:
@@ -17,6 +26,8 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.validate.outputs.version }}
+      should_publish: ${{ steps.publish_guard.outputs.should_publish }}
+      skip_reason: ${{ steps.publish_guard.outputs.skip_reason }}
     steps:
       - uses: actions/checkout@v4
       - name: Validate version consistency
@@ -25,6 +36,9 @@ jobs:
         run: |
           set -euo pipefail
           input_version="${{ inputs.version }}"
+          if [[ -z "${input_version}" ]]; then
+            input_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' desktop/src-tauri/Cargo.toml | head -1)"
+          fi
           if [[ ! "$input_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
             echo "::error::Invalid version format: ${input_version}"
             exit 1
@@ -63,9 +77,44 @@ jobs:
           PY
           echo "version=${input_version}" >> "$GITHUB_OUTPUT"
 
+      - name: Decide publish on push
+        id: publish_guard
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "should_publish=true" >> "$GITHUB_OUTPUT"
+            echo "skip_reason=manual_dispatch" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          before_sha="${{ github.event.before }}"
+          if [[ -z "${before_sha}" || "${before_sha}" == "0000000000000000000000000000000000000000" ]]; then
+            echo "should_publish=true" >> "$GITHUB_OUTPUT"
+            echo "skip_reason=initial_push" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          prev_version="$(git show "${before_sha}:desktop/src-tauri/Cargo.toml" 2>/dev/null | sed -n 's/^version = \"\\([^\"]*\\)\"/\\1/p' | head -1 || true)"
+          curr_version="${{ steps.validate.outputs.version }}"
+          if [[ -z "${prev_version}" ]]; then
+            echo "should_publish=true" >> "$GITHUB_OUTPUT"
+            echo "skip_reason=previous_version_missing" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [[ "${prev_version}" == "${curr_version}" ]]; then
+            echo "should_publish=false" >> "$GITHUB_OUTPUT"
+            echo "skip_reason=version_unchanged" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_publish=true" >> "$GITHUB_OUTPUT"
+            echo "skip_reason=version_changed" >> "$GITHUB_OUTPUT"
+          fi
+
   build-and-release:
     name: Build Desktop (${{ matrix.platform }})
     needs: [validate]
+    if: ${{ needs.validate.outputs.should_publish == 'true' }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
