@@ -173,6 +173,6 @@ jobs:
           projectPath: desktop
           tagName: desktop-latest
           releaseName: Desktop Update Channel
-          releaseBody: Automated desktop update channel release (current app version: __VERSION__)
+          releaseBody: "Automated desktop update channel release (current app version: __VERSION__)"
           releaseDraft: false
           prerelease: false
