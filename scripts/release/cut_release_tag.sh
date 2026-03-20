@@ -3,7 +3,7 @@ set -euo pipefail
 
 usage() {
   cat <<'USAGE'
-Usage: scripts/release/cut_release_tag.sh <tag> [--push]
+Usage: scripts/release/cut_release_tag.sh <tag> [--push] [--publish-desktop]
 
 Create an annotated release tag from the current checkout.
 
@@ -14,23 +14,62 @@ Requirements:
 - tag must not already exist locally or on origin
 
 Options:
-  --push   Push the tag to origin after creating it
+  --push              Push the tag to origin after creating it
+  --publish-desktop   Run scripts/release/publish_desktop_local.sh after tagging
 USAGE
 }
 
-if [[ $# -lt 1 || $# -gt 2 ]]; then
+if [[ $# -lt 1 || $# -gt 3 ]]; then
   usage
   exit 1
 fi
 
-TAG="$1"
+TAG=""
 PUSH_TAG="false"
-if [[ $# -eq 2 ]]; then
-  if [[ "$2" != "--push" ]]; then
+PUBLISH_DESKTOP="false"
+
+for arg in "$@"; do
+  case "$arg" in
+    --push)
+      PUSH_TAG="true"
+      ;;
+    --publish-desktop)
+      PUBLISH_DESKTOP="true"
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      if [[ -z "$TAG" ]]; then
+        TAG="$arg"
+      else
+        echo "error: unknown option or duplicate tag: $arg" >&2
+        usage
+        exit 1
+      fi
+      ;;
+  esac
+done
+
+if [[ -z "$TAG" ]]; then
+  echo "error: missing <tag>" >&2
+  usage
+  exit 1
+fi
+
+if [[ "$TAG" == --* ]]; then
+  echo "error: first positional argument must be a tag, got option: $TAG" >&2
+  usage
+  exit 1
+fi
+
+if [[ "$PUBLISH_DESKTOP" == "true" ]]; then
+  if [[ ! -f "scripts/release/publish_desktop_local.sh" ]]; then
+    echo "error: missing script scripts/release/publish_desktop_local.sh" >&2
     usage
     exit 1
   fi
-  PUSH_TAG="true"
 fi
 
 SEMVER_PATTERN='^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$'
@@ -77,7 +116,10 @@ echo "Created annotated tag: $TAG"
 if [[ "$PUSH_TAG" == "true" ]]; then
   git push origin "$TAG"
   echo "Pushed tag to origin: $TAG"
-  echo "GitHub release pipeline can be triggered via .github/workflows/promote-release.yml"
 else
   echo "Next step: git push origin $TAG"
+fi
+
+if [[ "$PUBLISH_DESKTOP" == "true" ]]; then
+  bash scripts/release/publish_desktop_local.sh
 fi
