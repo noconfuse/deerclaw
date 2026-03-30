@@ -10,7 +10,8 @@ Create an annotated release tag from the current checkout.
 Requirements:
 - tag must match vX.Y.Z (optional suffix like -rc.1)
 - working tree must be clean
-- HEAD must match origin default branch
+- current branch must be main
+- HEAD must match origin/main
 - tag must not already exist locally or on origin
 
 Options:
@@ -88,26 +89,25 @@ if ! git diff --quiet || ! git diff --cached --quiet; then
   exit 1
 fi
 
-REMOTE_DEFAULT_BRANCH="$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##' || true)"
-if [[ -z "$REMOTE_DEFAULT_BRANCH" ]]; then
-  if git ls-remote --exit-code --heads origin main >/dev/null 2>&1; then
-    REMOTE_DEFAULT_BRANCH="main"
-  elif git ls-remote --exit-code --heads origin master >/dev/null 2>&1; then
-    REMOTE_DEFAULT_BRANCH="master"
-  else
-    echo "error: cannot determine origin default branch (tried origin/HEAD, main, master)." >&2
-    exit 1
-  fi
+CURRENT_BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+if [[ "$CURRENT_BRANCH" != "main" ]]; then
+  echo "error: current branch must be main (current: ${CURRENT_BRANCH})." >&2
+  exit 1
 fi
 
-echo "Fetching origin/${REMOTE_DEFAULT_BRANCH} and tags..."
-git fetch --quiet origin "${REMOTE_DEFAULT_BRANCH}" --tags
+if ! git ls-remote --exit-code --heads origin main >/dev/null 2>&1; then
+  echo "error: origin/main does not exist." >&2
+  exit 1
+fi
+
+echo "Fetching origin/main and tags..."
+git fetch --quiet origin main --tags
 
 HEAD_SHA="$(git rev-parse HEAD)"
-DEFAULT_BRANCH_SHA="$(git rev-parse "origin/${REMOTE_DEFAULT_BRANCH}")"
-if [[ "$HEAD_SHA" != "$DEFAULT_BRANCH_SHA" ]]; then
-  echo "error: HEAD ($HEAD_SHA) is not origin/${REMOTE_DEFAULT_BRANCH} ($DEFAULT_BRANCH_SHA)." >&2
-  echo "hint: checkout/update ${REMOTE_DEFAULT_BRANCH} before cutting a release tag." >&2
+MAIN_SHA="$(git rev-parse "origin/main")"
+if [[ "$HEAD_SHA" != "$MAIN_SHA" ]]; then
+  echo "error: HEAD ($HEAD_SHA) is not origin/main ($MAIN_SHA)." >&2
+  echo "hint: checkout/update main before cutting a release tag." >&2
   exit 1
 fi
 

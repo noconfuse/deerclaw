@@ -68,6 +68,11 @@ Build artifacts are generated in:
 
 Use the local release scripts in `scripts/release`.
 
+Release guardrails:
+
+- Run release from `main` branch only
+- Local `HEAD` must match `origin/main`
+
 One-command flow (tag + push + desktop update publish):
 
 ```bash
