@@ -55,7 +55,7 @@ npm run tauri build
 
 Build artifacts are generated in:
 
-`desktop/src-tauri/target/release/bundle/`
+`target/release/bundle/`
 
 ## Desktop Auto Update
 
@@ -70,20 +70,20 @@ Use the local release scripts in `scripts/release`.
 
 Release guardrails:
 
-- Run release from `main` branch only
-- Local `HEAD` must match `origin/main`
+- Create new tag only from `main`, and local `HEAD` must match `origin/main`
+- If tag already exists, checkout that tag commit before publishing another platform
 
-One-command flow (tag + push + desktop update publish):
+Single entry command:
 
 ```bash
 bash scripts/release/cut_release_tag.sh vX.Y.Z --push --publish-desktop
 ```
 
-Desktop publish only:
+This command will:
 
-```bash
-bash scripts/release/publish_desktop_local.sh
-```
+- Create/push tag if the tag does not exist yet
+- If tag already exists, skip tag creation and only publish desktop assets
+- Publish updater assets for the current machine platform
 
 Optional flags:
 
@@ -91,6 +91,22 @@ Optional flags:
 - `--platform-key <key>`
 - `--repo <owner/repo>`
 - `--skip-build`
+
+Multi-platform release with the same command (recommended: build on each native OS):
+
+1. On macOS:
+
+```bash
+bash scripts/release/cut_release_tag.sh vX.Y.Z --push --publish-desktop
+```
+
+2. On Windows machine (checkout the same tag commit):
+
+```bash
+bash scripts/release/cut_release_tag.sh vX.Y.Z --publish-desktop --target x86_64-pc-windows-msvc --platform-key windows-x86_64
+```
+
+`latest.json` is merged by platform key, so running publish on another machine appends/replaces only that platform entry instead of overwriting all platforms.
 
 The publish script will:
 
