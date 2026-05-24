@@ -193,7 +193,7 @@ PY
 
   local tmp_dir latest_json_path existing_latest_json_path
   tmp_dir="$(mktemp -d)"
-  trap 'rm -rf "$tmp_dir"' EXIT
+  trap 'rm -rf "'"$tmp_dir"'"' EXIT
   latest_json_path="${tmp_dir}/latest.json"
   existing_latest_json_path="${tmp_dir}/latest.existing.json"
 

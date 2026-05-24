@@ -1,4 +1,5 @@
 use super::traits::{Tool, ToolResult};
+use crate::security::policy::ToolOperation;
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use futures_util::StreamExt;
@@ -107,19 +108,15 @@ impl Tool for WebFetchTool {
         })
     }
 
+    fn operation(&self, _args: &serde_json::Value) -> ToolOperation {
+        ToolOperation::Read
+    }
+
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         let url = args
             .get("url")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'url' parameter"))?;
-
-        if !self.security.can_act() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Action blocked: autonomy is read-only".into()),
-            });
-        }
 
         if !self.security.record_action() {
             return Ok(ToolResult {
@@ -709,24 +706,8 @@ mod tests {
     // ── Security policy ──────────────────────────────────────────
 
     #[tokio::test]
-    async fn blocks_readonly_mode() {
-        let security = Arc::new(SecurityPolicy {
-            autonomy: AutonomyLevel::ReadOnly,
-            ..SecurityPolicy::default()
-        });
-        let tool = WebFetchTool::new(security, vec!["example.com".into()], vec![], 500_000, 30);
-        let result = tool
-            .execute(json!({"url": "https://example.com"}))
-            .await
-            .unwrap();
-        assert!(!result.success);
-        assert!(result.error.unwrap().contains("read-only"));
-    }
-
-    #[tokio::test]
     async fn blocks_rate_limited() {
         let security = Arc::new(SecurityPolicy {
-            max_actions_per_hour: 0,
             ..SecurityPolicy::default()
         });
         let tool = WebFetchTool::new(security, vec!["example.com".into()], vec![], 500_000, 30);

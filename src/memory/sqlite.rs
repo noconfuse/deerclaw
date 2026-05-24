@@ -767,9 +767,8 @@ impl Memory for SqliteMemory {
 
         tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEntry>> {
             let conn = conn.lock();
-            let mut sql =
-                "SELECT id, key, content, category, created_at, session_id FROM memories"
-                    .to_string();
+            let mut sql = "SELECT id, key, content, category, created_at, session_id FROM memories"
+                .to_string();
             let mut conditions = Vec::new();
             let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
 

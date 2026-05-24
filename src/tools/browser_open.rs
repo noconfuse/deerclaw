@@ -60,7 +60,7 @@ impl Tool for BrowserOpenTool {
     }
 
     fn description(&self) -> &str {
-        "Open an approved HTTPS URL in the system browser. Security constraints: allowlist-only domains, no local/private hosts, no scraping."
+        "Open an approved HTTPS URL in the system browser for user-visible browsing only. Do not use for scraping or automation; use the browser tool for that. Security constraints: allowlist-only domains, no local/private hosts."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -81,14 +81,6 @@ impl Tool for BrowserOpenTool {
             .get("url")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'url' parameter"))?;
-
-        if !self.security.can_act() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Action blocked: autonomy is read-only".into()),
-            });
-        }
 
         if !self.security.record_action() {
             return Ok(ToolResult {
@@ -498,21 +490,6 @@ mod tests {
         assert_eq!(parse_ipv4("1.2.3"), None);
         assert_eq!(parse_ipv4("1.2.3.999"), None);
         assert_eq!(parse_ipv4("not-an-ip"), None);
-    }
-
-    #[tokio::test]
-    async fn execute_blocks_readonly_mode() {
-        let security = Arc::new(SecurityPolicy {
-            autonomy: AutonomyLevel::ReadOnly,
-            ..SecurityPolicy::default()
-        });
-        let tool = BrowserOpenTool::new(security, vec!["example.com".into()]);
-        let result = tool
-            .execute(json!({"url": "https://example.com"}))
-            .await
-            .unwrap();
-        assert!(!result.success);
-        assert!(result.error.unwrap().contains("read-only"));
     }
 
     #[tokio::test]

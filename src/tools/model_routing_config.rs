@@ -41,14 +41,6 @@ impl ModelRoutingConfigTool {
     }
 
     fn require_write_access(&self) -> Option<ToolResult> {
-        if !self.security.can_act() {
-            return Some(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Action blocked: autonomy is read-only".into()),
-            });
-        }
-
         if !self.security.record_action() {
             return Some(ToolResult {
                 success: false,
@@ -911,14 +903,6 @@ mod tests {
         })
     }
 
-    fn readonly_security() -> Arc<SecurityPolicy> {
-        Arc::new(SecurityPolicy {
-            autonomy: AutonomyLevel::ReadOnly,
-            workspace_dir: std::env::temp_dir(),
-            ..SecurityPolicy::default()
-        })
-    }
-
     async fn test_config(tmp: &TempDir) -> Arc<Config> {
         let config = Config {
             workspace_dir: tmp.path().join("workspace"),
@@ -1066,20 +1050,4 @@ mod tests {
         assert!(output["agents"]["coder"].is_null());
     }
 
-    #[tokio::test]
-    async fn read_only_mode_blocks_mutating_actions() {
-        let tmp = TempDir::new().unwrap();
-        let tool = ModelRoutingConfigTool::new(test_config(&tmp).await, readonly_security());
-
-        let result = tool
-            .execute(json!({
-                "action": "set_default",
-                "provider": "openai"
-            }))
-            .await
-            .unwrap();
-
-        assert!(!result.success);
-        assert!(result.error.unwrap_or_default().contains("read-only"));
-    }
 }

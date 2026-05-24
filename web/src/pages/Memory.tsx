@@ -10,6 +10,7 @@ import {
 import { useTranslation } from 'react-i18next';
 import type { MemoryEntry } from '@/types/api';
 import { getMemory, storeMemory, deleteMemory } from '@/lib/api';
+import { useNotify } from '@/hooks/useNotify';
 
 function truncate(text: string, max: number): string {
   if (text.length <= max) return text;
@@ -23,6 +24,7 @@ function formatDate(iso: string): string {
 
 export default function Memory() {
   const { t } = useTranslation();
+  const notify = useNotify();
   const [entries, setEntries] = useState<MemoryEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -42,7 +44,11 @@ export default function Memory() {
     setLoading(true);
     getMemory(q || undefined, cat || undefined)
       .then(setEntries)
-      .catch((err) => setError(err.message))
+      .catch((err) => {
+        const message = err instanceof Error ? err.message : t('memory.load_failed');
+        setError(message);
+        notify.error(message, { key: 'memory:load' });
+      })
       .finally(() => setLoading(false));
   };
 
@@ -79,7 +85,9 @@ export default function Memory() {
       setFormContent('');
       setFormCategory('');
     } catch (err: unknown) {
-      setFormError(err instanceof Error ? err.message : t('memory.store_failed'));
+      const message = err instanceof Error ? err.message : t('memory.store_failed');
+      setFormError(message);
+      notify.error(message, { key: 'memory:store:error' });
     } finally {
       setSubmitting(false);
     }
@@ -90,7 +98,9 @@ export default function Memory() {
       await deleteMemory(key);
       setEntries((prev) => prev.filter((e) => e.key !== key));
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : t('memory.delete_failed'));
+      const message = err instanceof Error ? err.message : t('memory.delete_failed');
+      setError(message);
+      notify.error(message, { key: 'memory:delete:error' });
     } finally {
       setConfirmDelete(null);
     }

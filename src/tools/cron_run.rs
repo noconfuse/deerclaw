@@ -67,14 +67,6 @@ impl Tool for CronRunTool {
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
 
-        if !self.security.can_act() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Security policy: read-only mode, cannot perform 'cron_run'".into()),
-            });
-        }
-
         if self.security.is_rate_limited() {
             return Ok(ToolResult {
                 success: false,
@@ -201,25 +193,6 @@ mod tests {
             .unwrap();
         assert!(!result.success);
         assert!(result.error.unwrap_or_default().contains("not found"));
-    }
-
-    #[tokio::test]
-    async fn blocks_run_in_read_only_mode() {
-        let tmp = TempDir::new().unwrap();
-        let mut config = Config {
-            workspace_dir: tmp.path().join("workspace"),
-            config_path: tmp.path().join("config.toml"),
-            ..Config::default()
-        };
-        config.autonomy.level = AutonomyLevel::ReadOnly;
-        std::fs::create_dir_all(&config.workspace_dir).unwrap();
-        let cfg = Arc::new(config);
-        let job = cron::add_job(&cfg, "*/5 * * * *", "echo run-now").unwrap();
-        let tool = CronRunTool::new(cfg.clone(), test_security(&cfg));
-
-        let result = tool.execute(json!({ "job_id": job.id })).await.unwrap();
-        assert!(!result.success);
-        assert!(result.error.unwrap_or_default().contains("read-only"));
     }
 
     #[tokio::test]

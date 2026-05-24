@@ -1,5 +1,5 @@
 use super::traits::{Tool, ToolResult};
-use crate::security::SecurityPolicy;
+use crate::security::{SecurityPolicy, policy::ToolOperation};
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
@@ -40,6 +40,10 @@ impl Tool for GlobSearchTool {
             },
             "required": ["pattern"]
         })
+    }
+
+    fn operation(&self, _args: &serde_json::Value) -> ToolOperation {
+        ToolOperation::Read
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
@@ -335,13 +339,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn glob_search_readonly_mode() {
+    async fn glob_search_supervised_mode() {
         let dir = TempDir::new().unwrap();
         std::fs::write(dir.path().join("file.txt"), "").unwrap();
 
         let tool = GlobSearchTool::new(test_security_with(
             dir.path().to_path_buf(),
-            AutonomyLevel::ReadOnly,
+            AutonomyLevel::Supervised,
             20,
         ));
         let result = tool.execute(json!({"pattern": "*.txt"})).await.unwrap();

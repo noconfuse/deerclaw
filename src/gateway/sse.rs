@@ -12,8 +12,8 @@ use axum::{
     },
 };
 use parking_lot::Mutex;
-use std::convert::Infallible;
 use std::collections::VecDeque;
+use std::convert::Infallible;
 use std::sync::Arc;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
@@ -45,9 +45,11 @@ pub async fn handle_sse_events(
         events.iter().cloned().collect::<Vec<_>>()
     };
 
-    let initial_stream = tokio_stream::iter(buffered.into_iter().map(|value| {
-        Ok::<_, Infallible>(Event::default().data(value.to_string()))
-    }));
+    let initial_stream = tokio_stream::iter(
+        buffered
+            .into_iter()
+            .map(|value| Ok::<_, Infallible>(Event::default().data(value.to_string()))),
+    );
     let rx = state.event_tx.subscribe();
     let live_stream = BroadcastStream::new(rx).filter_map(
         |result: Result<

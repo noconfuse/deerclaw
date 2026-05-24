@@ -10,15 +10,16 @@ import {
 import { useTranslation } from 'react-i18next';
 import type { DiagResult } from '@/types/api';
 import { runDoctor } from '@/lib/api';
+import { useNotify } from '@/hooks/useNotify';
 
 function severityIcon(severity: DiagResult['severity']) {
   switch (severity) {
     case 'ok':
-      return <CheckCircle className="h-4 w-4 text-green-400 flex-shrink-0" />;
+      return <CheckCircle className="h-4 w-4 shrink-0 text-green-400" />;
     case 'warn':
-      return <AlertTriangle className="h-4 w-4 text-yellow-400 flex-shrink-0" />;
+      return <AlertTriangle className="h-4 w-4 shrink-0 text-yellow-400" />;
     case 'error':
-      return <XCircle className="h-4 w-4 text-red-400 flex-shrink-0" />;
+      return <XCircle className="h-4 w-4 shrink-0 text-red-400" />;
   }
 }
 
@@ -46,6 +47,7 @@ function severityBg(severity: DiagResult['severity']): string {
 
 export default function Doctor() {
   const { t } = useTranslation();
+  const notify = useNotify();
   const [results, setResults] = useState<DiagResult[] | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -58,7 +60,9 @@ export default function Doctor() {
       const data = await runDoctor();
       setResults(data);
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : t('doctor.run_failed'));
+      const message = err instanceof Error ? err.message : t('doctor.run_failed');
+      setError(message);
+      notify.error(message, { key: 'doctor:run:error' });
     } finally {
       setLoading(false);
     }
@@ -185,7 +189,7 @@ export default function Doctor() {
             .sort(([a], [b]) => a.localeCompare(b))
             .map(([category, items]) => (
               <div key={category}>
-                <h3 className="text-sm font-semibold text-gray-400 uppercase tracking-wider mb-3 capitalize">
+                <h3 className="mb-3 text-sm font-semibold uppercase tracking-wider text-gray-400">
                   {category}
                 </h3>
                 <div className="space-y-2">

@@ -3,6 +3,50 @@ use crate::providers::{
     is_glm_alias, is_minimax_alias, is_moonshot_alias, is_qianfan_alias, is_qwen_alias,
     is_zai_alias,
 };
+use std::path::Path;
+
+fn composio_ready(config: &crate::config::Config) -> bool {
+    config.composio.enabled
+        && config
+            .composio
+            .api_key
+            .as_deref()
+            .is_some_and(|key| !key.trim().is_empty())
+}
+
+fn canvas_active(config: &crate::config::Config) -> bool {
+    let state_path = Path::new(&config.workspace_dir).join("canvas/main/.canvas_state.json");
+    std::fs::metadata(state_path).is_ok()
+}
+
+fn onepassword_native_active() -> bool {
+    onepassword_active_from_env(std::env::vars())
+}
+
+fn onepassword_active_from_env<I>(vars: I) -> bool
+where
+    I: IntoIterator<Item = (String, String)>,
+{
+    let mut has_connect_host = false;
+    let mut has_connect_token = false;
+    for (key, value) in vars {
+        let value = value.trim();
+        if value.is_empty() {
+            continue;
+        }
+        if key == "OP_SERVICE_ACCOUNT_TOKEN" {
+            return true;
+        }
+        if key == "OP_CONNECT_HOST" {
+            has_connect_host = true;
+        } else if key == "OP_CONNECT_TOKEN" {
+            has_connect_token = true;
+        } else if key.starts_with("OP_SESSION_") {
+            return true;
+        }
+    }
+    has_connect_host && has_connect_token
+}
 
 /// Returns the full catalog of integrations
 #[allow(clippy::too_many_lines)]
@@ -115,7 +159,13 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             name: "Nostr",
             description: "Decentralized DMs (NIP-04)",
             category: IntegrationCategory::Chat,
-            status_fn: |_| IntegrationStatus::ComingSoon,
+            status_fn: |c| {
+                if c.channels_config.nostr.is_some() {
+                    IntegrationStatus::Active
+                } else {
+                    IntegrationStatus::Available
+                }
+            },
         },
         IntegrationEntry {
             name: "WebChat",
@@ -127,7 +177,13 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             name: "Nextcloud Talk",
             description: "Self-hosted Nextcloud chat",
             category: IntegrationCategory::Chat,
-            status_fn: |_| IntegrationStatus::ComingSoon,
+            status_fn: |c| {
+                if c.channels_config.nextcloud_talk.is_some() {
+                    IntegrationStatus::Active
+                } else {
+                    IntegrationStatus::Available
+                }
+            },
         },
         IntegrationEntry {
             name: "Zalo",
@@ -501,13 +557,25 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             name: "GitHub",
             description: "Code, issues, PRs",
             category: IntegrationCategory::Productivity,
-            status_fn: |_| IntegrationStatus::ComingSoon,
+            status_fn: |c| {
+                if composio_ready(c) {
+                    IntegrationStatus::Available
+                } else {
+                    IntegrationStatus::ComingSoon
+                }
+            },
         },
         IntegrationEntry {
             name: "Notion",
             description: "Workspace & databases",
             category: IntegrationCategory::Productivity,
-            status_fn: |_| IntegrationStatus::ComingSoon,
+            status_fn: |c| {
+                if composio_ready(c) {
+                    IntegrationStatus::Available
+                } else {
+                    IntegrationStatus::ComingSoon
+                }
+            },
         },
         IntegrationEntry {
             name: "Apple Notes",
@@ -624,13 +692,25 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             name: "Gmail",
             description: "Email triggers & send",
             category: IntegrationCategory::ToolsAutomation,
-            status_fn: |_| IntegrationStatus::ComingSoon,
+            status_fn: |c| {
+                if composio_ready(c) {
+                    IntegrationStatus::Available
+                } else {
+                    IntegrationStatus::ComingSoon
+                }
+            },
         },
         IntegrationEntry {
             name: "1Password",
             description: "Secure credentials",
             category: IntegrationCategory::ToolsAutomation,
-            status_fn: |_| IntegrationStatus::ComingSoon,
+            status_fn: |_| {
+                if onepassword_native_active() {
+                    IntegrationStatus::Active
+                } else {
+                    IntegrationStatus::Available
+                }
+            },
         },
         IntegrationEntry {
             name: "Weather",
@@ -642,7 +722,13 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             name: "Canvas",
             description: "Visual workspace + A2UI",
             category: IntegrationCategory::ToolsAutomation,
-            status_fn: |_| IntegrationStatus::ComingSoon,
+            status_fn: |c| {
+                if canvas_active(c) {
+                    IntegrationStatus::Active
+                } else {
+                    IntegrationStatus::Available
+                }
+            },
         },
         // ── Media & Creative ────────────────────────────────────
         IntegrationEntry {
@@ -661,7 +747,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             name: "Screen Capture",
             description: "Screenshot & screen control",
             category: IntegrationCategory::MediaCreative,
-            status_fn: |_| IntegrationStatus::ComingSoon,
+            status_fn: |_| IntegrationStatus::Available,
         },
         IntegrationEntry {
             name: "Camera",
@@ -737,8 +823,12 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::schema::{IMessageConfig, MatrixConfig, StreamMode, TelegramConfig};
+    use crate::config::schema::{
+        ComposioConfig, IMessageConfig, MatrixConfig, NextcloudTalkConfig, NostrConfig, StreamMode,
+        TelegramConfig,
+    };
     use crate::config::Config;
+    use tempfile::TempDir;
 
     #[test]
     fn registry_has_entries() {
@@ -871,10 +961,160 @@ mod tests {
     }
 
     #[test]
+    fn nostr_available_when_not_configured() {
+        let config = Config::default();
+        let entries = all_integrations();
+        let nostr = entries.iter().find(|e| e.name == "Nostr").unwrap();
+        assert!(matches!(
+            (nostr.status_fn)(&config),
+            IntegrationStatus::Available
+        ));
+    }
+
+    #[test]
+    fn nostr_active_when_configured() {
+        let mut config = Config::default();
+        config.channels_config.nostr = Some(NostrConfig {
+            private_key: "nsec1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq"
+                .to_string(),
+            relays: vec!["wss://relay.damus.io".to_string()],
+            allowed_pubkeys: vec![],
+        });
+        let entries = all_integrations();
+        let nostr = entries.iter().find(|e| e.name == "Nostr").unwrap();
+        assert!(matches!(
+            (nostr.status_fn)(&config),
+            IntegrationStatus::Active
+        ));
+    }
+
+    #[test]
+    fn nextcloud_talk_available_when_not_configured() {
+        let config = Config::default();
+        let entries = all_integrations();
+        let nc = entries.iter().find(|e| e.name == "Nextcloud Talk").unwrap();
+        assert!(matches!(
+            (nc.status_fn)(&config),
+            IntegrationStatus::Available
+        ));
+    }
+
+    #[test]
+    fn nextcloud_talk_active_when_configured() {
+        let mut config = Config::default();
+        config.channels_config.nextcloud_talk = Some(NextcloudTalkConfig {
+            base_url: "https://cloud.example.com".to_string(),
+            app_token: "token".to_string(),
+            webhook_secret: None,
+            allowed_users: vec!["*".to_string()],
+        });
+        let entries = all_integrations();
+        let nc = entries.iter().find(|e| e.name == "Nextcloud Talk").unwrap();
+        assert!(matches!((nc.status_fn)(&config), IntegrationStatus::Active));
+    }
+
+    #[test]
+    fn composio_backed_integrations_available_when_composio_ready() {
+        let mut config = Config::default();
+        config.composio = ComposioConfig {
+            enabled: true,
+            api_key: Some("cmp_live_test".to_string()),
+            entity_id: "default".to_string(),
+        };
+        let entries = all_integrations();
+        for name in ["GitHub", "Notion", "Gmail"] {
+            let entry = entries.iter().find(|e| e.name == name).unwrap();
+            assert!(
+                matches!((entry.status_fn)(&config), IntegrationStatus::Available),
+                "{name} should be Available when Composio is configured"
+            );
+        }
+    }
+
+    #[test]
+    fn onepassword_available_by_default() {
+        let config = Config::default();
+        let entries = all_integrations();
+        let onepassword = entries.iter().find(|e| e.name == "1Password").unwrap();
+        assert!(matches!(
+            (onepassword.status_fn)(&config),
+            IntegrationStatus::Available
+        ));
+    }
+
+    #[test]
+    fn onepassword_env_service_token_is_active() {
+        let vars = vec![("OP_SERVICE_ACCOUNT_TOKEN".to_string(), "token".to_string())];
+        assert!(onepassword_active_from_env(vars));
+    }
+
+    #[test]
+    fn onepassword_env_connect_pair_is_active() {
+        let vars = vec![
+            (
+                "OP_CONNECT_HOST".to_string(),
+                "http://127.0.0.1:8080".to_string(),
+            ),
+            ("OP_CONNECT_TOKEN".to_string(), "token".to_string()),
+        ];
+        assert!(onepassword_active_from_env(vars));
+    }
+
+    #[test]
+    fn onepassword_env_session_var_is_active() {
+        let vars = vec![("OP_SESSION_my".to_string(), "token".to_string())];
+        assert!(onepassword_active_from_env(vars));
+    }
+
+    #[test]
+    fn screen_capture_is_available() {
+        let config = Config::default();
+        let entries = all_integrations();
+        let screen_capture = entries.iter().find(|e| e.name == "Screen Capture").unwrap();
+        assert!(matches!(
+            (screen_capture.status_fn)(&config),
+            IntegrationStatus::Available
+        ));
+    }
+
+    #[test]
+    fn canvas_is_available() {
+        let config = Config::default();
+        let entries = all_integrations();
+        let canvas = entries.iter().find(|e| e.name == "Canvas").unwrap();
+        assert!(matches!(
+            (canvas.status_fn)(&config),
+            IntegrationStatus::Available
+        ));
+    }
+
+    #[test]
+    fn canvas_is_active_when_session_state_exists() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.workspace_dir = temp_dir.path().to_path_buf();
+
+        let state_path = temp_dir.path().join("canvas/main/.canvas_state.json");
+        std::fs::create_dir_all(state_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &state_path,
+            r#"{"current_target":"file:///tmp/canvas/main/index.html"}"#,
+        )
+        .unwrap();
+
+        let entries = all_integrations();
+        let canvas = entries.iter().find(|e| e.name == "Canvas").unwrap();
+        assert!(matches!(
+            (canvas.status_fn)(&config),
+            IntegrationStatus::Active
+        ));
+    }
+
+    #[test]
     fn coming_soon_integrations_stay_coming_soon() {
         let config = Config::default();
         let entries = all_integrations();
-        for name in ["Nostr", "Spotify", "Home Assistant"] {
+        for name in ["Weather", "Spotify", "Home Assistant"] {
             let entry = entries.iter().find(|e| e.name == name).unwrap();
             assert!(
                 matches!((entry.status_fn)(&config), IntegrationStatus::ComingSoon),

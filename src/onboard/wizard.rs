@@ -123,7 +123,7 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
 
     // ── Build config ──
     // Defaults: SQLite memory, supervised autonomy, workspace-scoped, native runtime
-    let config = Config {
+    let mut config = Config {
         workspace_dir: workspace_dir.clone(),
         config_path: config_path.clone(),
         api_key: if api_key.is_empty() {
@@ -183,6 +183,7 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
         if config.memory.auto_save { "on" } else { "off" }
     );
 
+    sync_default_model_context_window_from_live(&mut config);
     config.save().await?;
     persist_workspace_selection(&config.config_path).await?;
 
@@ -295,6 +296,7 @@ async fn run_provider_update_wizard(workspace_dir: &Path, config_path: &Path) ->
     print_step(1, 1, "AI Provider & API Key");
     let (provider, api_key, model, provider_api_url) = setup_provider(workspace_dir).await?;
     apply_provider_update(&mut config, provider, api_key, model, provider_api_url);
+    sync_default_model_context_window_from_live(&mut config);
 
     config.save().await?;
     persist_workspace_selection(&config.config_path).await?;
@@ -1218,6 +1220,81 @@ fn normalize_model_ids(ids: Vec<String>) -> Vec<String> {
     unique.into_values().collect()
 }
 
+fn normalize_model_lookup_key(model: &str) -> Option<String> {
+    let trimmed = model.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(trimmed.to_ascii_lowercase())
+}
+
+fn value_as_usize(value: &Value) -> Option<usize> {
+    if let Some(v) = value.as_u64() {
+        return usize::try_from(v).ok();
+    }
+    value
+        .as_str()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+}
+
+fn extract_context_window_tokens(model: &Value) -> Option<usize> {
+    model
+        .get("context_length")
+        .and_then(value_as_usize)
+        .or_else(|| model.get("context_window").and_then(value_as_usize))
+        .or_else(|| model.get("max_context_length").and_then(value_as_usize))
+        .or_else(|| model.get("max_input_tokens").and_then(value_as_usize))
+        .or_else(|| model.get("input_token_limit").and_then(value_as_usize))
+        .or_else(|| {
+            model
+                .get("top_provider")
+                .and_then(|v| v.get("context_length"))
+                .and_then(value_as_usize)
+        })
+        .or_else(|| {
+            model
+                .get("limits")
+                .and_then(|v| v.get("context_window"))
+                .and_then(value_as_usize)
+        })
+        .filter(|tokens| *tokens > 0)
+}
+
+fn parse_openai_compatible_context_window_for_model(payload: &Value, model: &str) -> Option<usize> {
+    let needle = normalize_model_lookup_key(model)?;
+    let data = payload
+        .get("data")
+        .and_then(Value::as_array)
+        .or_else(|| payload.as_array())?;
+    for entry in data {
+        let Some(id) = entry.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        if normalize_model_lookup_key(id).as_deref() == Some(needle.as_str()) {
+            return extract_context_window_tokens(entry);
+        }
+    }
+    None
+}
+
+fn parse_gemini_context_window_for_model(payload: &Value, model: &str) -> Option<usize> {
+    let needle = normalize_model_lookup_key(model)?;
+    let models = payload.get("models").and_then(Value::as_array)?;
+    for entry in models {
+        let Some(name) = entry.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        let normalized_name = name.trim_start_matches("models/");
+        if normalize_model_lookup_key(normalized_name).as_deref() == Some(needle.as_str()) {
+            return entry
+                .get("inputTokenLimit")
+                .and_then(value_as_usize)
+                .filter(|tokens| *tokens > 0);
+        }
+    }
+    None
+}
+
 fn parse_openai_compatible_model_ids(payload: &Value) -> Vec<String> {
     let mut models = Vec::new();
 
@@ -1279,6 +1356,34 @@ fn parse_ollama_model_ids(payload: &Value) -> Vec<String> {
     }
 
     normalize_model_ids(ids)
+}
+
+fn resolve_effective_model_fetch_api_key(
+    provider_name: &str,
+    api_key: &str,
+    provider_api_url: Option<&str>,
+) -> Option<String> {
+    let provider_name = canonical_provider_name(provider_name);
+    let ollama_remote = provider_name == "ollama" && ollama_uses_remote_endpoint(provider_api_url);
+    if !api_key.trim().is_empty() {
+        return Some(api_key.trim().to_string());
+    }
+    if provider_name == "ollama" && !ollama_remote {
+        return None;
+    }
+    std::env::var(provider_env_var(provider_name))
+        .ok()
+        .or_else(|| {
+            if provider_name == "anthropic" {
+                std::env::var("ANTHROPIC_OAUTH_TOKEN").ok()
+            } else if provider_name == "minimax" {
+                std::env::var("MINIMAX_OAUTH_TOKEN").ok()
+            } else {
+                None
+            }
+        })
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn fetch_openai_compatible_models(
@@ -1475,28 +1580,8 @@ fn fetch_live_models_for_provider(
     let requested_provider_name = provider_name;
     let provider_name = canonical_provider_name(provider_name);
     let ollama_remote = provider_name == "ollama" && ollama_uses_remote_endpoint(provider_api_url);
-    let api_key = if api_key.trim().is_empty() {
-        if provider_name == "ollama" && !ollama_remote {
-            None
-        } else {
-            std::env::var(provider_env_var(provider_name))
-                .ok()
-                .or_else(|| {
-                    // Anthropic also accepts OAuth setup-tokens via ANTHROPIC_OAUTH_TOKEN
-                    if provider_name == "anthropic" {
-                        std::env::var("ANTHROPIC_OAUTH_TOKEN").ok()
-                    } else if provider_name == "minimax" {
-                        std::env::var("MINIMAX_OAUTH_TOKEN").ok()
-                    } else {
-                        None
-                    }
-                })
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty())
-        }
-    } else {
-        Some(api_key.trim().to_string())
-    };
+    let api_key =
+        resolve_effective_model_fetch_api_key(requested_provider_name, api_key, provider_api_url);
 
     let models = match provider_name {
         "openrouter" => fetch_openrouter_models(api_key.as_deref())?,
@@ -1544,6 +1629,124 @@ fn fetch_live_models_for_provider(
     };
 
     Ok(models)
+}
+
+fn fetch_live_context_window_for_model(
+    provider_name: &str,
+    api_key: &str,
+    provider_api_url: Option<&str>,
+    model: &str,
+) -> Result<Option<usize>> {
+    let requested_provider_name = provider_name;
+    let provider_name = canonical_provider_name(provider_name);
+    let api_key =
+        resolve_effective_model_fetch_api_key(requested_provider_name, api_key, provider_api_url);
+    match provider_name {
+        "openrouter" => {
+            let client = build_model_fetch_client()?;
+            let mut request = client.get("https://openrouter.ai/api/v1/models");
+            if let Some(api_key) = api_key.as_deref() {
+                request = request.bearer_auth(api_key);
+            }
+            let payload: Value = request
+                .send()
+                .and_then(reqwest::blocking::Response::error_for_status)
+                .context("model fetch failed: GET https://openrouter.ai/api/v1/models")?
+                .json()
+                .context("failed to parse OpenRouter model list response")?;
+            Ok(parse_openai_compatible_context_window_for_model(
+                &payload, model,
+            ))
+        }
+        "gemini" => {
+            let Some(api_key) = api_key.as_deref() else {
+                return Ok(None);
+            };
+            let client = build_model_fetch_client()?;
+            let payload: Value = client
+                .get("https://generativelanguage.googleapis.com/v1beta/models")
+                .query(&[("key", api_key), ("pageSize", "200")])
+                .send()
+                .and_then(reqwest::blocking::Response::error_for_status)
+                .context("model fetch failed: GET Gemini models")?
+                .json()
+                .context("failed to parse Gemini model list response")?;
+            Ok(parse_gemini_context_window_for_model(&payload, model))
+        }
+        "anthropic" => {
+            let Some(api_key) = api_key.as_deref() else {
+                return Ok(None);
+            };
+            let client = build_model_fetch_client()?;
+            let mut request = client
+                .get("https://api.anthropic.com/v1/models")
+                .header("anthropic-version", "2023-06-01");
+            if api_key.starts_with("sk-ant-oat01-") {
+                request = request
+                    .header("Authorization", format!("Bearer {api_key}"))
+                    .header("anthropic-beta", "oauth-2025-04-20");
+            } else {
+                request = request.header("x-api-key", api_key);
+            }
+            let response = request
+                .send()
+                .context("model fetch failed: GET https://api.anthropic.com/v1/models")?;
+            let status = response.status();
+            if !status.is_success() {
+                return Ok(None);
+            }
+            let payload: Value = response
+                .json()
+                .context("failed to parse Anthropic model list response")?;
+            Ok(parse_openai_compatible_context_window_for_model(
+                &payload, model,
+            ))
+        }
+        "ollama" => Ok(None),
+        _ => {
+            let Some(endpoint) =
+                resolve_live_models_endpoint(requested_provider_name, provider_api_url)
+            else {
+                return Ok(None);
+            };
+            let allow_unauthenticated = allows_unauthenticated_model_fetch(requested_provider_name);
+            let client = build_model_fetch_client()?;
+            let mut request = client.get(&endpoint);
+            if let Some(api_key) = api_key.as_deref() {
+                request = request.bearer_auth(api_key);
+            } else if !allow_unauthenticated {
+                return Ok(None);
+            }
+            let payload: Value = request
+                .send()
+                .and_then(reqwest::blocking::Response::error_for_status)
+                .with_context(|| format!("model fetch failed: GET {endpoint}"))?
+                .json()
+                .context("failed to parse model list response")?;
+            Ok(parse_openai_compatible_context_window_for_model(
+                &payload, model,
+            ))
+        }
+    }
+}
+
+fn sync_default_model_context_window_from_live(config: &mut Config) {
+    let Some(provider_name) = config.default_provider.clone() else {
+        return;
+    };
+    let Some(model) = config.default_model.clone() else {
+        return;
+    };
+    let api_key = config.api_key.clone().unwrap_or_default();
+    let provider_api_url = config.api_url.clone();
+    if let Ok(Some(tokens)) = fetch_live_context_window_for_model(
+        &provider_name,
+        &api_key,
+        provider_api_url.as_deref(),
+        &model,
+    ) {
+        config.set_cached_model_context_window_tokens(&model, tokens);
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1767,6 +1970,20 @@ pub async fn run_models_refresh(
     match fetch_live_models_for_provider(&provider_name, &api_key, config.api_url.as_deref()) {
         Ok(models) if !models.is_empty() => {
             cache_live_models_for_provider(&config.workspace_dir, &provider_name, &models).await?;
+            if config.default_provider.as_deref() == Some(provider_name.as_str()) {
+                if let Some(default_model) = config.default_model.as_deref() {
+                    let mut updated = config.clone();
+                    if let Ok(Some(tokens)) = fetch_live_context_window_for_model(
+                        &provider_name,
+                        &api_key,
+                        config.api_url.as_deref(),
+                        default_model,
+                    ) {
+                        updated.set_cached_model_context_window_tokens(default_model, tokens);
+                        updated.save().await?;
+                    }
+                }
+            }
             println!(
                 "Refreshed '{}' model cache with {} models.",
                 provider_name,
@@ -1852,6 +2069,15 @@ pub async fn run_models_set(config: &Config, model: &str) -> Result<()> {
 
     let mut updated = config.clone();
     updated.default_model = Some(model.to_string());
+    if let Some(provider_name) = updated.default_provider.as_deref() {
+        let api_key = updated.api_key.as_deref().unwrap_or("");
+        let provider_api_url = updated.api_url.as_deref();
+        if let Ok(Some(tokens)) =
+            fetch_live_context_window_for_model(provider_name, api_key, provider_api_url, model)
+        {
+            updated.set_cached_model_context_window_tokens(model, tokens);
+        }
+    }
     updated.save().await?;
 
     println!();

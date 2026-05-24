@@ -3,7 +3,7 @@
 //! This module replaces the raw TCP implementation with axum for:
 //! - Proper HTTP/1.1 parsing and compliance
 //! - Content-Length validation (handled by hyper)
-//! - Request body size limits (64KB max)
+//! - Request body size limits
 //! - Request timeouts (30s) to prevent slow-loris attacks
 //! - Header sanitization (handled by axum/hyper)
 
@@ -21,14 +21,14 @@ use crate::memory::{self, Memory, MemoryCategory};
 use crate::providers::{self, ChatMessage, Provider};
 use crate::runtime;
 use crate::security::pairing::{constant_time_eq, is_public_bind, PairingGuard};
-use crate::security::SecurityPolicy;
+use crate::security::{AutonomyLevel, SecurityPolicy};
 use crate::tools;
 use crate::tools::traits::{Tool, ToolSpec};
 use crate::util::truncate_with_ellipsis;
 use anyhow::{Context, Result};
 use axum::{
     body::Bytes,
-    extract::{ConnectInfo, Query, State},
+    extract::{ConnectInfo, DefaultBodyLimit, Query, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Json},
     routing::{delete, get, post, put},
@@ -37,6 +37,7 @@ use axum::{
 use parking_lot::Mutex;
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
@@ -44,8 +45,9 @@ use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
 use uuid::Uuid;
 
-/// Maximum request body size (64KB) — prevents memory exhaustion
-pub const MAX_BODY_SIZE: usize = 65_536;
+/// Maximum request body size (10MB) — large enough for dashboard attachment uploads
+/// while still bounding memory use for regular API traffic.
+pub const MAX_BODY_SIZE: usize = 10 * 1024 * 1024;
 /// Request timeout (30s) — prevents slow-loris attacks
 pub const REQUEST_TIMEOUT_SECS: u64 = 30;
 /// Sliding window used by gateway rate limiting.
@@ -56,12 +58,327 @@ pub const RATE_LIMIT_MAX_KEYS_DEFAULT: usize = 10_000;
 pub const IDEMPOTENCY_MAX_KEYS_DEFAULT: usize = 10_000;
 pub const ANONYMOUS_SENDER_KEY: &str = "web-local";
 pub const SSE_EVENT_HISTORY_CAP: usize = 200;
+pub(crate) const SESSION_WORKSPACE_PROJECT_LINK: &str = "project";
+const SESSION_WORKSPACE_LEGACY_SHARED_ENTRIES: &[&str] = &[
+    "IDENTITY.md",
+    "AGENTS.md",
+    "HEARTBEAT.md",
+    "SOUL.md",
+    "USER.md",
+    "BOOTSTRAP.md",
+    "MEMORY.md",
+    "TOOLS.md",
+    "memory",
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionExecutionPolicy {
+    pub autonomy_level: AutonomyLevel,
+}
+
+impl SessionExecutionPolicy {
+    pub fn from_config(config: &Config) -> Self {
+        Self {
+            autonomy_level: config.autonomy.level,
+        }
+    }
+}
+
+pub(crate) fn autonomy_level_to_wire(level: AutonomyLevel) -> &'static str {
+    match level {
+        AutonomyLevel::Supervised => "supervised",
+        AutonomyLevel::Full => "full",
+    }
+}
+
+pub(crate) fn autonomy_level_from_wire(value: &str) -> Option<AutonomyLevel> {
+    match value {
+        "supervised" => Some(AutonomyLevel::Supervised),
+        "full" => Some(AutonomyLevel::Full),
+        _ => None,
+    }
+}
+
+pub(crate) fn apply_session_policy_to_config(
+    config: &Config,
+    requested: SessionExecutionPolicy,
+) -> (Config, SessionExecutionPolicy) {
+    let effective_policy = requested;
+
+    let mut effective_config = config.clone();
+    effective_config.autonomy.level = effective_policy.autonomy_level;
+
+    (effective_config, effective_policy)
+}
+
+fn sanitize_task_session_component(session_id: &str) -> String {
+    session_id
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('_')
+        .to_string()
+}
+
+pub(crate) fn task_session_workspace_dir(base_workspace_dir: &Path, session_id: &str) -> PathBuf {
+    base_workspace_dir
+        .join("sessions")
+        .join(sanitize_task_session_component(session_id))
+        .join("workspace")
+}
+
+fn copy_dir_recursive(source: &Path, target: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(target)?;
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        let source_path = entry.path();
+        let target_path = target.join(entry.file_name());
+        let metadata = entry.metadata()?;
+        if metadata.is_dir() {
+            copy_dir_recursive(&source_path, &target_path)?;
+        } else if metadata.is_file() && !target_path.exists() {
+            std::fs::copy(&source_path, &target_path)?;
+        }
+    }
+    Ok(())
+}
+
+fn try_link_path(source: &Path, target: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(source, target)
+    }
+    #[cfg(windows)]
+    {
+        if source.is_dir() {
+            std::os::windows::fs::symlink_dir(source, target)
+        } else {
+            std::os::windows::fs::symlink_file(source, target)
+        }
+    }
+}
+
+fn ensure_copied_if_missing(source: &Path, target: &Path) -> std::io::Result<()> {
+    if target.exists() || !source.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    if source.is_dir() {
+        copy_dir_recursive(source, target)
+    } else {
+        std::fs::copy(source, target).map(|_| ())
+    }
+}
+
+fn ensure_linked_or_copied(source: &Path, target: &Path) -> std::io::Result<()> {
+    if target.exists() || !source.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    match try_link_path(source, target) {
+        Ok(()) => Ok(()),
+        Err(_) => ensure_copied_if_missing(source, target),
+    }
+}
+
+fn ensure_linked_if_missing(source: &Path, target: &Path) -> std::io::Result<()> {
+    if target.exists() || !source.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    try_link_path(source, target)
+}
+
+pub(crate) fn ensure_task_session_workspace(
+    base_workspace_dir: &Path,
+    session_id: &str,
+) -> Result<PathBuf> {
+    let session_workspace = task_session_workspace_dir(base_workspace_dir, session_id);
+    std::fs::create_dir_all(&session_workspace).with_context(|| {
+        format!(
+            "Failed to create session workspace directory {}",
+            session_workspace.display()
+        )
+    })?;
+
+    for entry_name in SESSION_WORKSPACE_LEGACY_SHARED_ENTRIES {
+        let entry_path = session_workspace.join(entry_name);
+        let Ok(metadata) = std::fs::symlink_metadata(&entry_path) else {
+            continue;
+        };
+
+        if metadata.file_type().is_dir() {
+            std::fs::remove_dir_all(&entry_path).with_context(|| {
+                format!(
+                    "Failed to remove legacy shared session workspace directory {}",
+                    entry_path.display()
+                )
+            })?;
+        } else {
+            std::fs::remove_file(&entry_path).with_context(|| {
+                format!(
+                    "Failed to remove legacy shared session workspace file {}",
+                    entry_path.display()
+                )
+            })?;
+        }
+    }
+
+    for dir_name in ["state", "cron"] {
+        std::fs::create_dir_all(session_workspace.join(dir_name)).with_context(|| {
+            format!(
+                "Failed to create session workspace subdirectory {}",
+                dir_name
+            )
+        })?;
+    }
+
+    ensure_linked_or_copied(
+        &base_workspace_dir.join("skills"),
+        &session_workspace.join("skills"),
+    )
+    .context("Failed to expose shared skills inside session workspace")?;
+
+    ensure_linked_if_missing(
+        base_workspace_dir,
+        &session_workspace.join(SESSION_WORKSPACE_PROJECT_LINK),
+    )
+    .context("Failed to expose base project workspace inside session workspace")?;
+
+    Ok(session_workspace)
+}
+
+pub(crate) fn apply_task_session_workspace_to_config(
+    config: &Config,
+    session_id: &str,
+) -> Result<(Config, PathBuf)> {
+    let base_workspace_dir = config.workspace_dir.clone();
+    let session_workspace = ensure_task_session_workspace(&base_workspace_dir, session_id)?;
+    let mut effective_config = config.clone();
+    let base_workspace_value = base_workspace_dir.to_string_lossy().to_string();
+    if !effective_config
+        .autonomy
+        .allowed_roots
+        .iter()
+        .any(|value| value == &base_workspace_value)
+    {
+        effective_config
+            .autonomy
+            .allowed_roots
+            .push(base_workspace_value);
+    }
+    effective_config.workspace_dir = session_workspace;
+    Ok((effective_config, base_workspace_dir))
+}
+
+pub(crate) fn runtime_inference_from_config(
+    config: &Config,
+    cost_tracker: Option<Arc<CostTracker>>,
+) -> Result<(Arc<dyn Provider>, String, f64)> {
+    let provider: Arc<dyn Provider> = Arc::from(providers::create_resilient_provider_with_options(
+        config.default_provider.as_deref().unwrap_or("openrouter"),
+        config.api_key.as_deref(),
+        config.api_url.as_deref(),
+        &config.reliability,
+        &providers::ProviderRuntimeOptions {
+            auth_profile_override: None,
+            provider_api_url: config.api_url.clone(),
+            zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
+            secrets_encrypt: config.secrets.encrypt,
+            reasoning_enabled: config.runtime.reasoning_enabled,
+            cost_tracker,
+        },
+    )?);
+    let model = config
+        .default_model
+        .clone()
+        .unwrap_or_else(|| "anthropic/claude-sonnet-4".into());
+    let temperature = config.default_temperature;
+    Ok((provider, model, temperature))
+}
+
+pub(crate) fn build_tools_and_skills_for_config(
+    config: &Config,
+    runtime: Arc<dyn runtime::RuntimeAdapter>,
+    security: Arc<SecurityPolicy>,
+    mem: Arc<dyn Memory>,
+) -> (Vec<Box<dyn Tool>>, Vec<crate::skills::Skill>) {
+    let (composio_key, composio_entity_id) = if config.composio.enabled {
+        (
+            config.composio.api_key.as_deref(),
+            Some(config.composio.entity_id.as_str()),
+        )
+    } else {
+        (None, None)
+    };
+
+    let mut tools_list = tools::all_tools_with_runtime(
+        Arc::new(config.clone()),
+        &security,
+        runtime.clone(),
+        mem,
+        composio_key,
+        composio_entity_id,
+        &config.browser,
+        &config.http_request,
+        &config.web_fetch,
+        &config.workspace_dir,
+        &config.agents,
+        config.api_key.as_deref(),
+        config,
+    );
+    let skills = crate::skills::load_skills_with_config(&config.workspace_dir, config);
+    for skill in &skills {
+        for tool in &skill.tools {
+            if tool.kind == "shell" {
+                let proxy = crate::skills::adapter::SkillProxyTool::new(
+                    tool.clone(),
+                    runtime.clone(),
+                    security.clone(),
+                );
+                tools_list.push(Box::new(proxy));
+            }
+        }
+    }
+    (tools_list, skills)
+}
 
 pub fn conversation_sender_key(token: Option<&str>) -> String {
     token
         .filter(|value| !value.is_empty())
         .map(str::to_string)
         .unwrap_or_else(|| ANONYMOUS_SENDER_KEY.to_string())
+}
+
+pub const TASK_SESSION_PREFIX: &str = "task:";
+pub const TASK_SESSION_PLACEHOLDER: &str = "[task session created]";
+
+pub fn is_task_session_id(session_id: &str) -> bool {
+    session_id
+        .strip_prefix(TASK_SESSION_PREFIX)
+        .is_some_and(|value| !value.trim().is_empty())
+}
+
+pub fn resolve_chat_session_key(token: Option<&str>, requested_session: Option<&str>) -> String {
+    match requested_session
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(session_id) if is_task_session_id(session_id) => session_id.to_string(),
+        _ => conversation_sender_key(token),
+    }
 }
 
 fn webhook_memory_key() -> String {
@@ -359,6 +676,8 @@ pub struct AppState {
     pub provider: Arc<dyn Provider>,
     pub model: String,
     pub temperature: f64,
+    pub runtime_adapter: Arc<dyn runtime::RuntimeAdapter>,
+    pub security: Arc<SecurityPolicy>,
     pub mem: Arc<dyn Memory>,
     pub auto_save: bool,
     /// SHA-256 hash of `X-Webhook-Secret` (hex-encoded), never plaintext.
@@ -388,6 +707,7 @@ pub struct AppState {
     pub non_cli_excluded_tools: Arc<Vec<String>>,
     pub conversation_histories: Arc<Mutex<HashMap<String, Vec<ChatMessage>>>>,
     pub cancellation_tokens: Arc<Mutex<HashMap<String, CancellationToken>>>,
+    pub session_policies: Arc<Mutex<HashMap<String, SessionExecutionPolicy>>>,
     /// Cost tracker (optional, for web dashboard cost page)
     pub cost_tracker: Option<Arc<CostTracker>>,
     /// SSE broadcast channel for real-time events
@@ -396,6 +716,19 @@ pub struct AppState {
 }
 
 impl AppState {
+    pub fn session_policy_for(&self, sender_key: &str, config: &Config) -> SessionExecutionPolicy {
+        let mut policies = self.session_policies.lock();
+        *policies
+            .entry(sender_key.to_string())
+            .or_insert_with(|| SessionExecutionPolicy::from_config(config))
+    }
+
+    pub fn update_session_policy(&self, sender_key: &str, policy: SessionExecutionPolicy) {
+        self.session_policies
+            .lock()
+            .insert(sender_key.to_string(), policy);
+    }
+
     pub fn remember_event(&self, event: serde_json::Value) {
         let mut events = self.recent_events.lock();
         if events.len() >= SSE_EVENT_HISTORY_CAP {
@@ -445,25 +778,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         }
     };
 
-    let provider: Arc<dyn Provider> = Arc::from(providers::create_resilient_provider_with_options(
-        config.default_provider.as_deref().unwrap_or("openrouter"),
-        config.api_key.as_deref(),
-        config.api_url.as_deref(),
-        &config.reliability,
-        &providers::ProviderRuntimeOptions {
-            auth_profile_override: None,
-            provider_api_url: config.api_url.clone(),
-            zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
-            secrets_encrypt: config.secrets.encrypt,
-            reasoning_enabled: config.runtime.reasoning_enabled,
-            cost_tracker: cost_tracker.clone(),
-        },
-    )?);
-    let model = config
-        .default_model
-        .clone()
-        .unwrap_or_else(|| "anthropic/claude-sonnet-4".into());
-    let temperature = config.default_temperature;
+    let (provider, model, temperature) =
+        runtime_inference_from_config(&config, cost_tracker.clone())?;
     let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage(
         &config.memory,
         Some(&config.storage.provider.config),
@@ -477,43 +793,12 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         &config.workspace_dir,
     ));
 
-    let (composio_key, composio_entity_id) = if config.composio.enabled {
-        (
-            config.composio.api_key.as_deref(),
-            Some(config.composio.entity_id.as_str()),
-        )
-    } else {
-        (None, None)
-    };
-
-    let mut tools_list = tools::all_tools_with_runtime(
-        Arc::new(config.clone()),
-        &security,
-        runtime.clone(),
-        Arc::clone(&mem),
-        composio_key,
-        composio_entity_id,
-        &config.browser,
-        &config.http_request,
-        &config.web_fetch,
-        &config.workspace_dir,
-        &config.agents,
-        config.api_key.as_deref(),
+    let (tools_list, skills) = build_tools_and_skills_for_config(
         &config,
+        runtime.clone(),
+        security.clone(),
+        Arc::clone(&mem),
     );
-    let skills = crate::skills::load_skills_with_config(&config.workspace_dir, &config);
-    for skill in &skills {
-        for tool in &skill.tools {
-            if tool.kind == "shell" {
-                let proxy = crate::skills::adapter::SkillProxyTool::new(
-                    tool.clone(),
-                    runtime.clone(),
-                    security.clone(),
-                );
-                tools_list.push(Box::new(proxy));
-            }
-        }
-    }
     let tools_registry: Arc<Vec<ToolSpec>> =
         Arc::new(tools_list.iter().map(|t| t.spec()).collect());
     let tools_registry_runtime = Arc::new(tools_list);
@@ -738,6 +1023,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         provider,
         model,
         temperature,
+        runtime_adapter: runtime,
+        security,
         mem,
         auto_save: config.memory.auto_save,
         webhook_secret_hash,
@@ -759,6 +1046,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         non_cli_excluded_tools: Arc::new(config.autonomy.non_cli_excluded_tools.clone()),
         conversation_histories: Arc::new(Mutex::new(HashMap::new())),
         cancellation_tokens: Arc::new(Mutex::new(HashMap::new())),
+        session_policies: Arc::new(Mutex::new(HashMap::new())),
         cost_tracker,
         event_tx,
         recent_events,
@@ -769,6 +1057,13 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/api/config", put(api::handle_api_config_put))
         .route("/api/config/form", put(api::handle_api_config_form_put))
         .layer(RequestBodyLimitLayer::new(1_048_576));
+    let chat_attachment_router = Router::new()
+        .route(
+            "/api/chat/attachments",
+            post(api::handle_api_chat_attachments_upload),
+        )
+        .layer(DefaultBodyLimit::max(MAX_BODY_SIZE))
+        .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE));
 
     // Build router with middleware
     let app = Router::new()
@@ -787,11 +1082,24 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/api/status", get(api::handle_api_status))
         .route("/api/config", get(api::handle_api_config_get))
         .route("/api/config/form", get(api::handle_api_config_form_get))
+        .route("/api/chat/history", get(api::handle_api_chat_history_get))
+        .route("/api/chat/workspace", get(api::handle_api_chat_workspace))
         .route(
-            "/api/chat/history",
-            get(api::handle_api_chat_history_get).delete(api::handle_api_chat_history_delete),
+            "/api/chat/workspace/preview",
+            get(api::handle_api_chat_workspace_preview),
         )
-        .route("/api/chat/sessions", get(api::handle_api_chat_sessions))
+        .route(
+            "/api/chat/workspace/open-folder",
+            post(api::handle_api_chat_workspace_open_folder),
+        )
+        .route(
+            "/api/chat/sessions",
+            get(api::handle_api_chat_sessions).post(api::handle_api_chat_session_create),
+        )
+        .route(
+            "/api/chat/sessions/{session_id}",
+            delete(api::handle_api_chat_session_delete),
+        )
         .route("/api/tools", get(api::handle_api_tools))
         .route("/api/skills", get(api::handle_api_skills_list))
         .route("/api/skills", post(api::handle_api_skills_install))
@@ -828,6 +1136,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         // ── Static assets (web dashboard) ──
         .route("/_app/{*path}", get(static_files::handle_static))
         // ── Config PUT with larger body limit ──
+        .merge(chat_attachment_router)
         .merge(config_put_router)
         .with_state(state)
         .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
@@ -967,18 +1276,20 @@ async fn persist_pairing_tokens(config: Arc<Mutex<Config>>, pairing: &PairingGua
 
 /// Simple chat for webhook endpoint (no tools, for backward compatibility and testing).
 async fn run_gateway_chat_simple(state: &AppState, message: &str) -> anyhow::Result<String> {
+    let runtime_config = state.config.lock().clone();
+    let (provider, model, temperature) =
+        runtime_inference_from_config(&runtime_config, state.cost_tracker.clone())?;
     let user_messages = vec![ChatMessage::user(message)];
 
     // Keep webhook/gateway prompts aligned with channel behavior by injecting
     // workspace-aware system context before model invocation.
     let system_prompt = {
-        let config_guard = state.config.lock();
         crate::channels::build_system_prompt(
-            &config_guard.workspace_dir,
-            &state.model,
+            &runtime_config.workspace_dir,
+            &model,
             &[], // tools - empty for simple chat
             &[], // skills
-            Some(&config_guard.identity),
+            Some(&runtime_config.identity),
             None, // bootstrap_max_chars - use default
         )
     };
@@ -987,13 +1298,12 @@ async fn run_gateway_chat_simple(state: &AppState, message: &str) -> anyhow::Res
     messages.push(ChatMessage::system(system_prompt));
     messages.extend(user_messages);
 
-    let multimodal_config = state.config.lock().multimodal.clone();
+    let multimodal_config = runtime_config.multimodal.clone();
     let prepared =
         crate::multimodal::prepare_messages_for_provider(&messages, &multimodal_config).await?;
 
-    state
-        .provider
-        .chat_with_history(&prepared.messages, &state.model, state.temperature)
+    provider
+        .chat_with_history(&prepared.messages, &model, temperature)
         .await
 }
 
@@ -1101,13 +1411,15 @@ async fn handle_webhook(
             .await;
     }
 
-    let provider_label = state
-        .config
-        .lock()
+    let runtime_config = state.config.lock().clone();
+    let provider_label = runtime_config
         .default_provider
         .clone()
         .unwrap_or_else(|| "unknown".to_string());
-    let model_label = state.model.clone();
+    let model_label = runtime_config
+        .default_model
+        .clone()
+        .unwrap_or_else(|| "anthropic/claude-sonnet-4".to_string());
     let started_at = Instant::now();
 
     state
@@ -1145,13 +1457,13 @@ async fn handle_webhook(
                 .observer
                 .record_event(&crate::observability::ObserverEvent::AgentEnd {
                     provider: provider_label,
-                    model: model_label,
+                    model: model_label.clone(),
                     duration,
                     tokens_used: None,
                     cost_usd: None,
                 });
 
-            let body = serde_json::json!({"response": response, "model": state.model});
+            let body = serde_json::json!({"response": response, "model": model_label});
             (StatusCode::OK, Json(body))
         }
         Err(e) => {
@@ -1677,8 +1989,8 @@ mod tests {
     }
 
     #[test]
-    fn security_body_limit_is_64kb() {
-        assert_eq!(MAX_BODY_SIZE, 65_536);
+    fn security_body_limit_is_10mb() {
+        assert_eq!(MAX_BODY_SIZE, 10 * 1024 * 1024);
     }
 
     #[test]
@@ -1721,6 +2033,13 @@ mod tests {
             provider: Arc::new(MockProvider::default()),
             model: "test-model".into(),
             temperature: 0.0,
+            runtime_adapter: Arc::from(
+                crate::runtime::create_runtime(&Config::default().runtime).unwrap(),
+            ),
+            security: Arc::new(SecurityPolicy::from_config(
+                &Config::default().autonomy,
+                &Config::default().workspace_dir,
+            )),
             mem: Arc::new(MockMemory),
             auto_save: false,
             webhook_secret_hash: None,
@@ -1742,6 +2061,7 @@ mod tests {
             non_cli_excluded_tools: Arc::new(Vec::new()),
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
             cancellation_tokens: Arc::new(Mutex::new(HashMap::new())),
+            session_policies: Arc::new(Mutex::new(HashMap::new())),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             recent_events: Arc::new(Mutex::new(VecDeque::new())),
@@ -1776,6 +2096,13 @@ mod tests {
             provider: Arc::new(MockProvider::default()),
             model: "test-model".into(),
             temperature: 0.0,
+            runtime_adapter: Arc::from(
+                crate::runtime::create_runtime(&Config::default().runtime).unwrap(),
+            ),
+            security: Arc::new(SecurityPolicy::from_config(
+                &Config::default().autonomy,
+                &Config::default().workspace_dir,
+            )),
             mem: Arc::new(MockMemory),
             auto_save: false,
             webhook_secret_hash: None,
@@ -1797,6 +2124,7 @@ mod tests {
             non_cli_excluded_tools: Arc::new(Vec::new()),
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
             cancellation_tokens: Arc::new(Mutex::new(HashMap::new())),
+            session_policies: Arc::new(Mutex::new(HashMap::new())),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             recent_events: Arc::new(Mutex::new(VecDeque::new())),
@@ -1943,6 +2271,47 @@ mod tests {
     fn normalize_max_keys_preserves_nonzero_values() {
         assert_eq!(normalize_max_keys(2_048, 10_000), 2_048);
         assert_eq!(normalize_max_keys(1, 10_000), 1);
+    }
+
+    #[test]
+    fn task_session_workspace_only_creates_session_state_and_shared_links() {
+        let temp = tempfile::tempdir().unwrap();
+        let base_workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(base_workspace.join("skills")).unwrap();
+        std::fs::write(base_workspace.join("SOUL.md"), "shared soul").unwrap();
+        std::fs::write(base_workspace.join("MEMORY.md"), "shared memory").unwrap();
+        let legacy_session_workspace =
+            task_session_workspace_dir(&base_workspace, "task:test-session");
+        std::fs::create_dir_all(legacy_session_workspace.join("memory")).unwrap();
+        std::fs::write(legacy_session_workspace.join("SOUL.md"), "legacy soul").unwrap();
+        std::fs::write(legacy_session_workspace.join("MEMORY.md"), "legacy memory").unwrap();
+
+        let session_workspace =
+            ensure_task_session_workspace(&base_workspace, "task:test-session").unwrap();
+
+        assert!(session_workspace.exists());
+        assert!(session_workspace.join("state").is_dir());
+        assert!(session_workspace.join("cron").is_dir());
+        assert!(!session_workspace.join("memory").exists());
+        assert!(!session_workspace.join("SOUL.md").exists());
+        assert!(!session_workspace.join("MEMORY.md").exists());
+        assert!(session_workspace.join("skills").exists());
+        assert!(session_workspace
+            .join(SESSION_WORKSPACE_PROJECT_LINK)
+            .exists());
+    }
+
+    #[test]
+    fn linking_project_workspace_requires_real_link() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let target = temp.path().join("nested").join("project");
+        std::fs::create_dir_all(&source).unwrap();
+
+        ensure_linked_if_missing(&source, &target).unwrap();
+
+        let metadata = std::fs::symlink_metadata(&target).unwrap();
+        assert!(metadata.file_type().is_symlink());
     }
 
     #[tokio::test]
@@ -2148,6 +2517,13 @@ mod tests {
             provider,
             model: "test-model".into(),
             temperature: 0.0,
+            runtime_adapter: Arc::from(
+                crate::runtime::create_runtime(&Config::default().runtime).unwrap(),
+            ),
+            security: Arc::new(SecurityPolicy::from_config(
+                &Config::default().autonomy,
+                &Config::default().workspace_dir,
+            )),
             mem: memory,
             auto_save: false,
             webhook_secret_hash: None,
@@ -2169,6 +2545,7 @@ mod tests {
             non_cli_excluded_tools: Arc::new(Vec::new()),
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
             cancellation_tokens: Arc::new(Mutex::new(HashMap::new())),
+            session_policies: Arc::new(Mutex::new(HashMap::new())),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             recent_events: Arc::new(Mutex::new(VecDeque::new())),
@@ -2218,6 +2595,13 @@ mod tests {
             provider,
             model: "test-model".into(),
             temperature: 0.0,
+            runtime_adapter: Arc::from(
+                crate::runtime::create_runtime(&Config::default().runtime).unwrap(),
+            ),
+            security: Arc::new(SecurityPolicy::from_config(
+                &Config::default().autonomy,
+                &Config::default().workspace_dir,
+            )),
             mem: memory,
             auto_save: true,
             webhook_secret_hash: None,
@@ -2239,6 +2623,7 @@ mod tests {
             non_cli_excluded_tools: Arc::new(Vec::new()),
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
             cancellation_tokens: Arc::new(Mutex::new(HashMap::new())),
+            session_policies: Arc::new(Mutex::new(HashMap::new())),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             recent_events: Arc::new(Mutex::new(VecDeque::new())),
@@ -2300,6 +2685,13 @@ mod tests {
             provider,
             model: "test-model".into(),
             temperature: 0.0,
+            runtime_adapter: Arc::from(
+                crate::runtime::create_runtime(&Config::default().runtime).unwrap(),
+            ),
+            security: Arc::new(SecurityPolicy::from_config(
+                &Config::default().autonomy,
+                &Config::default().workspace_dir,
+            )),
             mem: memory,
             auto_save: false,
             webhook_secret_hash: Some(Arc::from(hash_webhook_secret(&secret))),
@@ -2321,6 +2713,7 @@ mod tests {
             non_cli_excluded_tools: Arc::new(Vec::new()),
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
             cancellation_tokens: Arc::new(Mutex::new(HashMap::new())),
+            session_policies: Arc::new(Mutex::new(HashMap::new())),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             recent_events: Arc::new(Mutex::new(VecDeque::new())),
@@ -2354,6 +2747,13 @@ mod tests {
             provider,
             model: "test-model".into(),
             temperature: 0.0,
+            runtime_adapter: Arc::from(
+                crate::runtime::create_runtime(&Config::default().runtime).unwrap(),
+            ),
+            security: Arc::new(SecurityPolicy::from_config(
+                &Config::default().autonomy,
+                &Config::default().workspace_dir,
+            )),
             mem: memory,
             auto_save: false,
             webhook_secret_hash: Some(Arc::from(hash_webhook_secret(&valid_secret))),
@@ -2375,6 +2775,7 @@ mod tests {
             non_cli_excluded_tools: Arc::new(Vec::new()),
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
             cancellation_tokens: Arc::new(Mutex::new(HashMap::new())),
+            session_policies: Arc::new(Mutex::new(HashMap::new())),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             recent_events: Arc::new(Mutex::new(VecDeque::new())),
@@ -2413,6 +2814,13 @@ mod tests {
             provider,
             model: "test-model".into(),
             temperature: 0.0,
+            runtime_adapter: Arc::from(
+                crate::runtime::create_runtime(&Config::default().runtime).unwrap(),
+            ),
+            security: Arc::new(SecurityPolicy::from_config(
+                &Config::default().autonomy,
+                &Config::default().workspace_dir,
+            )),
             mem: memory,
             auto_save: false,
             webhook_secret_hash: Some(Arc::from(hash_webhook_secret(&secret))),
@@ -2434,6 +2842,7 @@ mod tests {
             non_cli_excluded_tools: Arc::new(Vec::new()),
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
             cancellation_tokens: Arc::new(Mutex::new(HashMap::new())),
+            session_policies: Arc::new(Mutex::new(HashMap::new())),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             recent_events: Arc::new(Mutex::new(VecDeque::new())),
@@ -2477,6 +2886,13 @@ mod tests {
             provider,
             model: "test-model".into(),
             temperature: 0.0,
+            runtime_adapter: Arc::from(
+                crate::runtime::create_runtime(&Config::default().runtime).unwrap(),
+            ),
+            security: Arc::new(SecurityPolicy::from_config(
+                &Config::default().autonomy,
+                &Config::default().workspace_dir,
+            )),
             mem: memory,
             auto_save: false,
             webhook_secret_hash: None,
@@ -2498,6 +2914,7 @@ mod tests {
             non_cli_excluded_tools: Arc::new(Vec::new()),
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
             cancellation_tokens: Arc::new(Mutex::new(HashMap::new())),
+            session_policies: Arc::new(Mutex::new(HashMap::new())),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             recent_events: Arc::new(Mutex::new(VecDeque::new())),
@@ -2537,6 +2954,13 @@ mod tests {
             provider,
             model: "test-model".into(),
             temperature: 0.0,
+            runtime_adapter: Arc::from(
+                crate::runtime::create_runtime(&Config::default().runtime).unwrap(),
+            ),
+            security: Arc::new(SecurityPolicy::from_config(
+                &Config::default().autonomy,
+                &Config::default().workspace_dir,
+            )),
             mem: memory,
             auto_save: false,
             webhook_secret_hash: None,
@@ -2558,6 +2982,7 @@ mod tests {
             non_cli_excluded_tools: Arc::new(Vec::new()),
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
             cancellation_tokens: Arc::new(Mutex::new(HashMap::new())),
+            session_policies: Arc::new(Mutex::new(HashMap::new())),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             recent_events: Arc::new(Mutex::new(VecDeque::new())),

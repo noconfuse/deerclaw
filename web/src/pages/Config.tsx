@@ -1,17 +1,43 @@
 import { useState, useEffect } from 'react';
+import { useNavigate, useSearchParams } from 'react-router-dom';
 import {
   Settings,
   Save,
-  CheckCircle,
   AlertTriangle,
   ShieldAlert,
   HelpCircle,
   ChevronDown,
+  Plus,
+  Trash2,
 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
-import { getConfig, getConfigForm, putConfig, putConfigForm } from '@/lib/api';
+import {
+  getConfig,
+  getConfigForm,
+  putConfig,
+  putConfigForm,
+} from '@/lib/api';
+import { CHANNEL_DEFS, CHANNEL_LABEL_MAP } from '@/lib/channels';
+import { useNotify } from '@/hooks/useNotify';
 
 type ConfigForm = Record<string, unknown>;
+type ConfigTab =
+  | 'general'
+  | 'channels'
+  | 'agent'
+  | 'gateway'
+  | 'runtime'
+  | 'memory'
+  | 'web_search'
+  | 'cost';
+
+const CONFIG_TABS = [
+  'gateway',
+  'runtime',
+  'memory',
+  'web_search',
+  'cost',
+] as const;
 
 const PROVIDER_OPTIONS = [
   { id: 'openrouter', label: 'OpenRouter (Recommended)' },
@@ -56,30 +82,77 @@ const PROVIDER_OPTIONS = [
   { id: 'custom', label: 'Custom Provider' },
 ];
 
+const normalizeProviderValue = (provider: string, apiUrl: string) => {
+  const trimmedProvider = provider.trim();
+  if (trimmedProvider !== 'custom') {
+    return trimmedProvider || undefined;
+  }
+
+  const normalizedUrl = apiUrl.trim().replace(/\/+$/, '');
+  if (!normalizedUrl) {
+    throw new Error('Custom Provider requires an API Base URL');
+  }
+
+  return `custom:${normalizedUrl}`;
+};
+
+const getProviderUiCopy = (isCustomProvider: boolean) => ({
+  providerHelpKey: isCustomProvider
+    ? 'config.form.provider_help_custom'
+    : 'config.form.provider_help_default',
+  apiUrlLabelKey: isCustomProvider
+    ? 'config.form.api_url_label_custom'
+    : 'config.form.api_url_label',
+  apiUrlPlaceholderKey: isCustomProvider
+    ? 'config.form.api_url_placeholder_custom'
+    : 'config.form.api_url_placeholder',
+  apiUrlHelpKey: isCustomProvider
+    ? 'config.form.api_url_help_custom'
+    : 'config.form.api_url_help_default',
+});
+
 export default function Config() {
   const { t } = useTranslation();
+  const notify = useNotify();
+  const navigate = useNavigate();
+  const [searchParams, setSearchParams] = useSearchParams();
   const [viewMode, setViewMode] = useState<'form' | 'toml'>('form');
-  const [activeTab, setActiveTab] = useState<
-    | 'general'
-    | 'agent'
-    | 'gateway'
-    | 'autonomy'
-    | 'browser'
-    | 'runtime'
-    | 'memory'
-    | 'web_search'
-    | 'cost'
-  >('general');
+  const [activeTab, setActiveTab] = useState<ConfigTab>('gateway');
   const [config, setConfig] = useState<ConfigForm | null>(null);
   const [toml, setToml] = useState('');
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [success, setSuccess] = useState<string | null>(null);
   const [openHelp, setOpenHelp] = useState<string | null>(null);
   const [allowedCommandsText, setAllowedCommandsText] = useState('');
-  const [forbiddenPathsText, setForbiddenPathsText] = useState('');
-  const [browserAllowedDomainsText, setBrowserAllowedDomainsText] = useState('');
+  const [blockedCommandsText, setBlockedCommandsText] = useState('');
+  const [proxyNoProxyText, setProxyNoProxyText] = useState('');
+  const [proxyServicesText, setProxyServicesText] = useState('');
+  const [channelToAdd, setChannelToAdd] = useState(CHANNEL_DEFS[0]?.id ?? '');
+  const [channelEditMode, setChannelEditMode] = useState<Record<string, 'form' | 'json'>>({});
+  const [channelDrafts, setChannelDrafts] = useState<Record<string, string>>({});
+
+  useEffect(() => {
+    const requestedTab = searchParams.get('tab');
+    if (requestedTab === 'channels') {
+      navigate('/channels', { replace: true });
+      return;
+    }
+    if (requestedTab === 'general' || requestedTab === 'agent') {
+      navigate('/deerclaw-settings', { replace: true });
+      return;
+    }
+    if (CONFIG_TABS.includes(requestedTab as (typeof CONFIG_TABS)[number])) {
+      setActiveTab(requestedTab as ConfigTab);
+    }
+  }, [navigate, searchParams]);
+
+  const selectTab = (tab: ConfigTab) => {
+    setActiveTab(tab);
+    const nextParams = new URLSearchParams(searchParams);
+    nextParams.set('tab', tab);
+    setSearchParams(nextParams, { replace: true });
+  };
 
   useEffect(() => {
     const load = async () => {
@@ -91,7 +164,9 @@ export default function Config() {
         setConfig(formData);
         setToml(tomlData);
       } catch (err: unknown) {
-        setError(err instanceof Error ? err.message : t('config.error'));
+        const message = err instanceof Error ? err.message : t('config.error');
+        setError(message);
+        notify.error(message, { key: 'config:load' });
       } finally {
         setLoading(false);
       }
@@ -102,7 +177,6 @@ export default function Config() {
   const handleSave = async () => {
     setSaving(true);
     setError(null);
-    setSuccess(null);
     try {
       if (viewMode === 'toml') {
         if (!toml) {
@@ -129,27 +203,55 @@ export default function Config() {
           cursor[lastKey] = value;
         };
         setPathValue(['autonomy', 'allowed_commands'], parseList(allowedCommandsText));
-        setPathValue(['autonomy', 'forbidden_paths'], parseList(forbiddenPathsText));
-        setPathValue(['browser', 'allowed_domains'], parseList(browserAllowedDomainsText));
+        setPathValue(['autonomy', 'blocked_commands'], parseList(blockedCommandsText));
+        setPathValue(['proxy', 'no_proxy'], parseList(proxyNoProxyText));
+        setPathValue(['proxy', 'services'], parseList(proxyServicesText));
+        const channelsConfig =
+          ((nextConfig.channels_config as Record<string, unknown> | undefined) ?? {}) as Record<
+            string,
+            unknown
+          >;
+        for (const channelId of Object.keys(channelDrafts)) {
+          if (channelsConfig[channelId] === undefined || channelsConfig[channelId] === null) {
+            continue;
+          }
+          try {
+            const parsed = JSON.parse(channelDrafts[channelId] || '{}');
+            if (parsed === null || Array.isArray(parsed) || typeof parsed !== 'object') {
+              throw new Error('invalid json object');
+            }
+            channelsConfig[channelId] = parsed as Record<string, unknown>;
+          } catch {
+            throw new Error(
+              t('config.channels.invalid_json', {
+                channel: CHANNEL_LABEL_MAP[channelId] ?? channelId,
+              }),
+            );
+          }
+        }
+        nextConfig.channels_config = channelsConfig;
+        setPathValue(
+          ['default_provider'],
+          normalizeProviderValue(
+            ((nextConfig.default_provider as string | undefined) ?? ''),
+            ((nextConfig.api_url as string | undefined) ?? ''),
+          ),
+        );
         await putConfigForm(nextConfig);
         setConfig(nextConfig);
         const refreshed = await getConfig();
         setToml(refreshed);
       }
-      setSuccess(t('config.saved'));
+      const message = t('config.saved');
+      notify.success(message, { key: 'config:save:success' });
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : t('config.error'));
+      const message = err instanceof Error ? err.message : t('config.error');
+      setError(message);
+      notify.error(message, { key: 'config:save:error' });
     } finally {
       setSaving(false);
     }
   };
-
-  // Auto-dismiss success after 4 seconds
-  useEffect(() => {
-    if (!success) return;
-    const timer = setTimeout(() => setSuccess(null), 4000);
-    return () => clearTimeout(timer);
-  }, [success]);
 
   const formatList = (value: unknown) => (Array.isArray(value) ? value.join('\n') : '');
   const parseList = (raw: string) =>
@@ -157,18 +259,55 @@ export default function Config() {
       .split('\n')
       .map((line) => line.trim())
       .filter(Boolean);
+  const model = ((config as ConfigForm | null)?.default_model as string | undefined) ?? '';
+  const normalizedModelKey = model.trim().toLowerCase();
+  const modelContextWindows =
+    ((((config as ConfigForm | null)?.agent as Record<string, unknown> | undefined)
+      ?.model_context_windows as
+      | Record<string, unknown>
+      | undefined)) ?? {};
+  const defaultModelContextWindowTokens = normalizedModelKey
+    ? ((modelContextWindows[normalizedModelKey] as Record<string, unknown> | undefined)
+        ?.context_window_tokens as number | undefined) ?? 0
+    : 0;
+  const modelContextWindowTtlSecs =
+    ((((config as ConfigForm | null)?.agent as Record<string, unknown> | undefined)
+      ?.model_context_window_ttl_secs as
+      | number
+      | undefined)) ?? 604800;
 
   useEffect(() => {
     if (!config) return;
     setAllowedCommandsText(
       formatList((config.autonomy as Record<string, unknown> | undefined)?.allowed_commands),
     );
-    setForbiddenPathsText(
-      formatList((config.autonomy as Record<string, unknown> | undefined)?.forbidden_paths),
+    setBlockedCommandsText(
+      formatList((config.autonomy as Record<string, unknown> | undefined)?.blocked_commands),
     );
-    setBrowserAllowedDomainsText(
-      formatList((config.browser as Record<string, unknown> | undefined)?.allowed_domains),
+    setProxyNoProxyText(
+      formatList((config.proxy as Record<string, unknown> | undefined)?.no_proxy),
     );
+    setProxyServicesText(
+      formatList((config.proxy as Record<string, unknown> | undefined)?.services),
+    );
+    const channelsConfig =
+      ((config.channels_config as Record<string, unknown> | undefined) ?? {}) as Record<
+        string,
+        unknown
+      >;
+    setChannelDrafts(
+      Object.fromEntries(
+        CHANNEL_DEFS.filter((channel) => channelsConfig[channel.id] !== undefined && channelsConfig[channel.id] !== null)
+          .map((channel) => [
+            channel.id,
+            JSON.stringify(channelsConfig[channel.id], null, 2),
+          ]),
+      ) as Record<string, string>,
+    );
+    const firstAvailableChannel = CHANNEL_DEFS.find(
+      (channel) => channelsConfig[channel.id] === undefined || channelsConfig[channel.id] === null,
+    );
+    setChannelToAdd(firstAvailableChannel?.id ?? '');
   }, [config]);
 
   if (loading) {
@@ -206,15 +345,135 @@ export default function Config() {
     });
   };
 
+  const channelsConfig =
+    ((config.channels_config as Record<string, unknown> | undefined) ?? {}) as Record<
+      string,
+      unknown
+    >;
+  const configuredChannelIds = CHANNEL_DEFS
+    .map((channel) => channel.id)
+    .filter((channelId) => channelsConfig[channelId] !== undefined && channelsConfig[channelId] !== null);
+  const availableChannels = CHANNEL_DEFS.filter(
+    (channel) => !configuredChannelIds.includes(channel.id),
+  );
+
+  const updateChannelsConfig = (updater: (channels: Record<string, unknown>) => void) => {
+    setConfig((prev) => {
+      if (!prev) return prev;
+      const next = structuredClone(prev) as ConfigForm;
+      const nextChannels =
+        ((next.channels_config as Record<string, unknown> | undefined) ?? {}) as Record<
+          string,
+          unknown
+        >;
+      updater(nextChannels);
+      next.channels_config = nextChannels;
+      return next;
+    });
+  };
+
+  const parseChannelConfig = (channelId: string): Record<string, unknown> | null => {
+    const raw = channelDrafts[channelId] ?? JSON.stringify(channelsConfig[channelId] ?? {}, null, 2);
+    try {
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        return parsed as Record<string, unknown>;
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  };
+
+  const syncChannelDraft = (channelId: string, value: Record<string, unknown>) => {
+    setChannelDrafts((prev) => ({
+      ...prev,
+      [channelId]: JSON.stringify(value, null, 2),
+    }));
+  };
+
+  const addChannel = () => {
+    const channel = availableChannels.find((item) => item.id === channelToAdd) ?? availableChannels[0];
+    if (!channel) return;
+    const nextValue = structuredClone(channel.template) as Record<string, unknown>;
+    updateChannelsConfig((nextChannels) => {
+      nextChannels[channel.id] = nextValue;
+    });
+    syncChannelDraft(channel.id, nextValue);
+    setChannelEditMode((prev) => ({ ...prev, [channel.id]: 'form' }));
+    const nextAvailable = availableChannels.find((item) => item.id !== channel.id);
+    setChannelToAdd(nextAvailable?.id ?? '');
+  };
+
+  const removeChannel = (channelId: string) => {
+    updateChannelsConfig((nextChannels) => {
+      delete nextChannels[channelId];
+    });
+    setChannelDrafts((prev) => {
+      const next = { ...prev };
+      delete next[channelId];
+      return next;
+    });
+    setChannelEditMode((prev) => {
+      const next = { ...prev };
+      delete next[channelId];
+      return next;
+    });
+  };
+
+  const updateChannelField = (
+    channelId: string,
+    field: string,
+    currentValue: unknown,
+    rawValue: string | boolean,
+  ) => {
+    const parsed = parseChannelConfig(channelId);
+    if (!parsed) return;
+    let nextValue: unknown = rawValue;
+    if (typeof currentValue === 'number') {
+      const n = Number(rawValue);
+      nextValue = Number.isNaN(n) ? 0 : n;
+    } else if (typeof currentValue === 'boolean') {
+      nextValue = Boolean(rawValue);
+    } else if (Array.isArray(currentValue)) {
+      nextValue = String(rawValue).split(',').map((v) => v.trim()).filter(Boolean);
+    } else if (currentValue === null && typeof rawValue === 'string' && rawValue.trim() === '') {
+      nextValue = null;
+    }
+    const next = { ...parsed, [field]: nextValue };
+    updateChannelsConfig((nextChannels) => {
+      nextChannels[channelId] = next;
+    });
+    syncChannelDraft(channelId, next);
+  };
+
   const toggleHelp = (key: string) => {
     setOpenHelp((prev) => (prev === key ? null : key));
   };
 
   const selectClassName =
     'mt-2 w-full appearance-none rounded-lg bg-gray-950 border border-gray-800 px-3 py-2 pr-9 text-sm text-gray-200 focus:outline-none focus:ring-2 focus:ring-blue-500 cursor-pointer';
+  const renderSwitch = (checked: boolean) => (
+    <span
+      className={`relative inline-block h-5 w-10 rounded-full transition-colors ${
+        checked ? 'bg-blue-600' : 'bg-gray-700'
+      }`}
+    >
+      <span
+        className={`absolute left-1 top-1 h-3 w-3 rounded-full bg-white transition-transform ${
+          checked ? 'translate-x-5' : ''
+        }`}
+      />
+    </span>
+  );
 
-  const provider = (config.default_provider as string | undefined) ?? '';
-  const model = (config.default_model as string | undefined) ?? '';
+  const rawProvider = (config.default_provider as string | undefined) ?? '';
+  const apiKey = (config.api_key as string | undefined) ?? '';
+  const isCustomProvider = rawProvider.startsWith('custom:');
+  const provider = isCustomProvider ? 'custom' : rawProvider;
+  const apiUrl =
+    ((config.api_url as string | undefined) ?? '') ||
+    (isCustomProvider ? rawProvider.slice('custom:'.length) : '');
   const temperature = (config.default_temperature as number | undefined) ?? 0;
   const gatewayPort =
     ((config.gateway as Record<string, unknown> | undefined)?.port as number | undefined) ?? 3000;
@@ -226,6 +485,9 @@ export default function Config() {
     ((config.agent as Record<string, unknown> | undefined)?.max_history_messages as
       | number
       | undefined) ?? 50;
+  const modelContextWindowTokensInput = defaultModelContextWindowTokens > 0
+    ? defaultModelContextWindowTokens
+    : '';
   const compactContext =
     ((config.agent as Record<string, unknown> | undefined)?.compact_context as
       | boolean
@@ -238,39 +500,6 @@ export default function Config() {
     ((config.agent as Record<string, unknown> | undefined)?.tool_dispatcher as
       | string
       | undefined) ?? 'auto';
-  const browserEnabled =
-    ((config.browser as Record<string, unknown> | undefined)?.enabled as boolean | undefined) ??
-    false;
-  const browserBackend =
-    ((config.browser as Record<string, unknown> | undefined)?.backend as string | undefined) ?? '';
-  const browserNativeHeadless =
-    ((config.browser as Record<string, unknown> | undefined)?.native_headless as
-      | boolean
-      | undefined) ?? false;
-  const browserNativeWebdriverUrl =
-    ((config.browser as Record<string, unknown> | undefined)?.native_webdriver_url as
-      | string
-      | undefined) ?? '';
-  const computerUseEnabled =
-    (((config.browser as Record<string, unknown> | undefined)?.computer_use as Record<
-      string,
-      unknown
-    > | undefined)?.enabled as boolean | undefined) ?? false;
-  const computerUseEndpoint =
-    (((config.browser as Record<string, unknown> | undefined)?.computer_use as Record<
-      string,
-      unknown
-    > | undefined)?.endpoint as string | undefined) ?? '';
-  const computerUseTimeout =
-    (((config.browser as Record<string, unknown> | undefined)?.computer_use as Record<
-      string,
-      unknown
-    > | undefined)?.timeout_ms as number | undefined) ?? 15000;
-  const computerUseAllowRemote =
-    (((config.browser as Record<string, unknown> | undefined)?.computer_use as Record<
-      string,
-      unknown
-    > | undefined)?.allow_remote_endpoint as boolean | undefined) ?? false;
   const gatewayHost =
     ((config.gateway as Record<string, unknown> | undefined)?.host as string | undefined) ?? '';
   const gatewayRequirePairing =
@@ -281,32 +510,13 @@ export default function Config() {
     ((config.gateway as Record<string, unknown> | undefined)?.allow_public_bind as
       | boolean
       | undefined) ?? false;
-  const autonomyLevel =
-    ((config.autonomy as Record<string, unknown> | undefined)?.level as string | undefined) ??
-    'supervised';
-  const autonomyWorkspaceOnly =
-    ((config.autonomy as Record<string, unknown> | undefined)?.workspace_only as
-      | boolean
-      | undefined) ?? true;
-  const autonomyMaxActionsPerHour =
-    ((config.autonomy as Record<string, unknown> | undefined)?.max_actions_per_hour as
-      | number
-      | undefined) ?? 100;
-  const autonomyMaxCostPerDay =
-    ((config.autonomy as Record<string, unknown> | undefined)?.max_cost_per_day_cents as
-      | number
-      | undefined) ?? 1000;
-  const autonomyRequireApproval =
-    ((config.autonomy as Record<string, unknown> | undefined)?.require_approval_for_medium_risk as
-      | boolean
-      | undefined) ?? true;
-  const autonomyBlockHighRisk =
-    ((config.autonomy as Record<string, unknown> | undefined)?.block_high_risk_commands as
-      | boolean
-      | undefined) ?? true;
-  const autonomyNonCliExcludedTools = formatList(
-    (config.autonomy as Record<string, unknown> | undefined)?.non_cli_excluded_tools,
-  );
+  const proxyEnabled =
+    ((config.proxy as Record<string, unknown> | undefined)?.enabled as boolean | undefined) ??
+    false;
+  const proxyScope =
+    ((config.proxy as Record<string, unknown> | undefined)?.scope as string | undefined) ??
+    'zeroclaw';
+  const proxyMode = !proxyEnabled ? 'direct' : 'system';
   const runtimeKind =
     ((config.runtime as Record<string, unknown> | undefined)?.kind as string | undefined) ?? '';
   const memoryBackend =
@@ -357,6 +567,7 @@ export default function Config() {
       | number
       | undefined) ?? 80;
   const hasKnownProvider = PROVIDER_OPTIONS.some((option) => option.id === provider);
+  const providerUiCopy = getProviderUiCopy(provider === 'custom');
 
   return (
     <div className="p-6 space-y-6">
@@ -402,7 +613,7 @@ export default function Config() {
       </div>
 
       <div className="flex items-start gap-3 bg-yellow-900/20 border border-yellow-700/40 rounded-lg p-4">
-        <ShieldAlert className="h-5 w-5 text-yellow-400 flex-shrink-0 mt-0.5" />
+        <ShieldAlert className="mt-0.5 h-5 w-5 shrink-0 text-yellow-400" />
         <div>
           <p className="text-sm text-yellow-300 font-medium">
             {t('config.masked_title')}
@@ -413,16 +624,9 @@ export default function Config() {
         </div>
       </div>
 
-      {success && (
-        <div className="flex items-center gap-2 bg-green-900/30 border border-green-700 rounded-lg p-3">
-          <CheckCircle className="h-4 w-4 text-green-400 flex-shrink-0" />
-          <span className="text-sm text-green-300">{success}</span>
-        </div>
-      )}
-
       {error && (
         <div className="flex items-center gap-2 bg-red-900/30 border border-red-700 rounded-lg p-3">
-          <AlertTriangle className="h-4 w-4 text-red-400 flex-shrink-0" />
+          <AlertTriangle className="h-4 w-4 shrink-0 text-red-400" />
           <span className="text-sm text-red-300">{error}</span>
         </div>
       )}
@@ -453,11 +657,7 @@ export default function Config() {
         <div className="space-y-6">
           <div className="flex flex-wrap items-center gap-2 bg-gray-900 border border-gray-800 rounded-lg p-2">
             {[
-              { key: 'general', label: t('config.tabs.general') },
-              { key: 'agent', label: t('config.tabs.agent') },
               { key: 'gateway', label: t('config.tabs.gateway') },
-              { key: 'autonomy', label: t('config.tabs.autonomy') },
-              { key: 'browser', label: t('config.tabs.browser') },
               { key: 'runtime', label: t('config.tabs.runtime') },
               { key: 'memory', label: t('config.tabs.memory') },
               { key: 'web_search', label: t('config.tabs.web_search') },
@@ -467,18 +667,7 @@ export default function Config() {
                 key={tab.key}
                 type="button"
                 onClick={() =>
-                  setActiveTab(
-                    tab.key as
-                      | 'general'
-                      | 'agent'
-                      | 'gateway'
-                      | 'autonomy'
-                      | 'browser'
-                      | 'runtime'
-                      | 'memory'
-                      | 'web_search'
-                      | 'cost',
-                  )
+                  selectTab(tab.key as ConfigTab)
                 }
                 className={`px-3 py-1 text-xs font-medium rounded-md transition-colors ${
                   activeTab === tab.key
@@ -519,6 +708,7 @@ export default function Config() {
               </select>
               <ChevronDown className="pointer-events-none absolute right-3 top-1/2 h-4 w-4 -translate-y-1/2 text-gray-500" />
             </div>
+            <p className="mt-2 text-xs text-gray-500">{t(providerUiCopy.providerHelpKey)}</p>
           </div>
           <div>
             <label className="text-xs text-gray-400">{t('config.form.model_label')}</label>
@@ -527,6 +717,28 @@ export default function Config() {
               onChange={(e) => updateConfig(['default_model'], e.target.value)}
               className="mt-2 w-full rounded-lg bg-gray-950 border border-gray-800 px-3 py-2 text-sm text-gray-200 focus:outline-none focus:ring-2 focus:ring-blue-500"
             />
+          </div>
+          <div>
+            <label className="text-xs text-gray-400">{t('config.form.api_key_label')}</label>
+            <input
+              type="password"
+              value={apiKey}
+              onChange={(e) => updateConfig(['api_key'], e.target.value)}
+              placeholder={t('config.form.api_key_placeholder')}
+              className="mt-2 w-full rounded-lg bg-gray-950 border border-gray-800 px-3 py-2 text-sm text-gray-200 focus:outline-none focus:ring-2 focus:ring-blue-500"
+            />
+          </div>
+          <div>
+            <label className="text-xs text-gray-400">
+              {t(providerUiCopy.apiUrlLabelKey)}
+            </label>
+            <input
+              value={apiUrl}
+              onChange={(e) => updateConfig(['api_url'], e.target.value)}
+              placeholder={t(providerUiCopy.apiUrlPlaceholderKey)}
+              className="mt-2 w-full rounded-lg bg-gray-950 border border-gray-800 px-3 py-2 text-sm text-gray-200 focus:outline-none focus:ring-2 focus:ring-blue-500"
+            />
+            <p className="mt-2 text-xs text-gray-500">{t(providerUiCopy.apiUrlHelpKey)}</p>
           </div>
           <div>
             <label className="text-xs text-gray-400">{t('config.form.temperature_label')}</label>
@@ -538,6 +750,166 @@ export default function Config() {
               className="mt-2 w-full rounded-lg bg-gray-950 border border-gray-800 px-3 py-2 text-sm text-gray-200 focus:outline-none focus:ring-2 focus:ring-blue-500"
             />
           </div>
+        </div>
+        )}
+
+        {activeTab === 'channels' && (
+        <div className="space-y-6">
+          <div className="rounded-xl border border-gray-800 bg-gray-900 p-5">
+            <div className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
+              <div>
+                <h3 className="text-sm font-semibold text-gray-200">
+                  {t('config.channels.title')}
+                </h3>
+                <p className="mt-1 text-sm text-gray-400">
+                  {t('config.channels.description')}
+                </p>
+              </div>
+              <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+                <div className="relative min-w-[220px]">
+                  <select
+                    value={channelToAdd}
+                    onChange={(e) => setChannelToAdd(e.target.value)}
+                    disabled={availableChannels.length === 0}
+                    className={selectClassName}
+                  >
+                    {availableChannels.length === 0 ? (
+                      <option value="">{t('config.channels.all_added')}</option>
+                    ) : (
+                      availableChannels.map((channel) => (
+                        <option key={channel.id} value={channel.id}>
+                          {channel.label}
+                        </option>
+                      ))
+                    )}
+                  </select>
+                  <ChevronDown className="pointer-events-none absolute right-3 top-1/2 h-4 w-4 -translate-y-1/2 text-gray-500" />
+                </div>
+                <button
+                  type="button"
+                  onClick={addChannel}
+                  disabled={availableChannels.length === 0}
+                  className="inline-flex items-center justify-center gap-2 rounded-lg bg-blue-600 px-3 py-2 text-sm font-medium text-white transition-colors hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  <Plus className="h-4 w-4" />
+                  {t('config.channels.add')}
+                </button>
+              </div>
+            </div>
+          </div>
+
+          {configuredChannelIds.length === 0 ? (
+            <div className="rounded-xl border border-dashed border-gray-700 bg-gray-900/50 p-8 text-center">
+              <p className="text-sm font-medium text-gray-200">{t('config.channels.empty_title')}</p>
+              <p className="mt-2 text-sm text-gray-500">{t('config.channels.empty_desc')}</p>
+            </div>
+          ) : (
+            <div className="space-y-4">
+              {configuredChannelIds.map((channelId) => {
+                const channel = CHANNEL_DEFS.find((item) => item.id === channelId);
+                const parsed = parseChannelConfig(channelId);
+                const mode = channelEditMode[channelId] ?? 'form';
+                return (
+                  <div key={channelId} className="rounded-xl border border-gray-800 bg-gray-900 p-5">
+                    <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                      <div>
+                        <div className="text-sm font-semibold text-gray-100">
+                          {channel?.label ?? channelId}
+                        </div>
+                        <div className="mt-1 text-xs text-gray-500">
+                          {channel?.description ?? t('config.channels.custom_channel')}
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <div className="flex items-center rounded-lg border border-gray-800 bg-gray-950 p-1">
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setChannelEditMode((prev) => ({ ...prev, [channelId]: 'form' }))
+                            }
+                            className={`rounded-md px-2 py-1 text-xs font-medium ${
+                              mode === 'form'
+                                ? 'bg-blue-600 text-white'
+                                : 'text-gray-400 hover:text-gray-200'
+                            }`}
+                          >
+                            {t('config.channels.form_mode')}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setChannelEditMode((prev) => ({ ...prev, [channelId]: 'json' }))
+                            }
+                            className={`rounded-md px-2 py-1 text-xs font-medium ${
+                              mode === 'json'
+                                ? 'bg-blue-600 text-white'
+                                : 'text-gray-400 hover:text-gray-200'
+                            }`}
+                          >
+                            {t('config.channels.json_mode')}
+                          </button>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => removeChannel(channelId)}
+                          className="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-red-900/60 bg-red-950/30 text-red-300 transition-colors hover:bg-red-900/40"
+                          title={t('config.channels.remove')}
+                        >
+                          <Trash2 className="h-4 w-4" />
+                        </button>
+                      </div>
+                    </div>
+
+                    {mode !== 'json' && parsed ? (
+                      <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+                        {Object.entries(parsed).map(([field, value]) => (
+                          <label key={field} className="text-xs text-gray-400">
+                            {field}
+                            {typeof value === 'boolean' ? (
+                              <div className="mt-2 flex items-center justify-between rounded-lg border border-gray-800 bg-gray-950 px-3 py-2">
+                                <span className="text-sm text-gray-300">
+                                  {value ? t('common.enabled') : t('common.disabled')}
+                                </span>
+                                <input
+                                  type="checkbox"
+                                  checked={value}
+                                  onChange={(e) =>
+                                    updateChannelField(channelId, field, value, e.target.checked)
+                                  }
+                                />
+                              </div>
+                            ) : (
+                              <input
+                                type={typeof value === 'number' ? 'number' : 'text'}
+                                value={Array.isArray(value) ? value.join(', ') : value === null ? '' : String(value)}
+                                onChange={(e) =>
+                                  updateChannelField(channelId, field, value, e.target.value)
+                                }
+                                className="mt-2 w-full rounded-lg border border-gray-800 bg-gray-950 px-3 py-2 text-sm text-gray-200 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                              />
+                            )}
+                          </label>
+                        ))}
+                      </div>
+                    ) : (
+                      <textarea
+                        value={
+                          channelDrafts[channelId] ??
+                          JSON.stringify(channelsConfig[channelId] ?? {}, null, 2)
+                        }
+                        onChange={(e) =>
+                          setChannelDrafts((prev) => ({ ...prev, [channelId]: e.target.value }))
+                        }
+                        className="min-h-[260px] w-full rounded-lg border border-gray-800 bg-gray-950 p-3 font-mono text-sm text-gray-200 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                        spellCheck={false}
+                        autoComplete="off"
+                      />
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
         </div>
         )}
 
@@ -603,6 +975,89 @@ export default function Config() {
           <div>
             <div className="flex items-center gap-2">
               <label className="text-xs text-gray-400">
+                {t('config.form.model_context_window_tokens_label')}
+              </label>
+              <button
+                type="button"
+                onClick={() => toggleHelp('model_context_window_tokens')}
+                className="text-gray-500 hover:text-blue-400"
+              >
+                <HelpCircle className="h-4 w-4" />
+              </button>
+            </div>
+            {openHelp === 'model_context_window_tokens' && (
+              <p className="text-xs text-gray-500 mt-2">
+                {t('config.form.model_context_window_tokens_help')}
+              </p>
+            )}
+            <input
+              type="number"
+              min={0}
+              step={1}
+              value={modelContextWindowTokensInput}
+              onChange={(e) => {
+                const raw = e.target.value.trim();
+                const next = structuredClone(config) as ConfigForm;
+                const agent = ((next.agent as Record<string, unknown> | undefined) ?? {}) as Record<
+                  string,
+                  unknown
+                >;
+                const windows = ((agent.model_context_windows as Record<string, unknown> | undefined) ??
+                  {}) as Record<string, unknown>;
+                if (normalizedModelKey) {
+                  const isPositiveInteger = /^[1-9]\d*$/.test(raw);
+                  const tokens = Number.parseInt(raw, 10);
+                  if (!isPositiveInteger || !Number.isFinite(tokens) || tokens <= 0) {
+                    delete windows[normalizedModelKey];
+                  } else {
+                    windows[normalizedModelKey] = {
+                      context_window_tokens: tokens,
+                      updated_at_unix: Math.floor(Date.now() / 1000),
+                    };
+                  }
+                }
+                agent.model_context_windows = windows;
+                next.agent = agent;
+                setConfig(next);
+              }}
+              placeholder={t('config.form.model_context_window_tokens_placeholder')}
+              className="mt-2 w-full rounded-lg bg-gray-950 border border-gray-800 px-3 py-2 text-sm text-gray-200 focus:outline-none focus:ring-2 focus:ring-blue-500"
+            />
+          </div>
+          <div>
+            <div className="flex items-center gap-2">
+              <label className="text-xs text-gray-400">
+                {t('config.form.model_context_window_ttl_label')}
+              </label>
+              <button
+                type="button"
+                onClick={() => toggleHelp('model_context_window_ttl')}
+                className="text-gray-500 hover:text-blue-400"
+              >
+                <HelpCircle className="h-4 w-4" />
+              </button>
+            </div>
+            {openHelp === 'model_context_window_ttl' && (
+              <p className="text-xs text-gray-500 mt-2">
+                {t('config.form.model_context_window_ttl_help')}
+              </p>
+            )}
+            <input
+              type="number"
+              min={1}
+              value={modelContextWindowTtlSecs}
+              onChange={(e) =>
+                updateConfig(
+                  ['agent', 'model_context_window_ttl_secs'],
+                  Math.max(1, Number(e.target.value) || 1),
+                )
+              }
+              className="mt-2 w-full rounded-lg bg-gray-950 border border-gray-800 px-3 py-2 text-sm text-gray-200 focus:outline-none focus:ring-2 focus:ring-blue-500"
+            />
+          </div>
+          <div>
+            <div className="flex items-center gap-2">
+              <label className="text-xs text-gray-400">
                 {t('config.form.tool_dispatcher_label')}
               </label>
               <button
@@ -658,9 +1113,7 @@ export default function Config() {
                 onChange={(e) => updateConfig(['agent', 'compact_context'], e.target.checked)}
                 className="sr-only peer"
               />
-              <div className="w-10 h-5 bg-gray-700 rounded-full peer peer-checked:bg-blue-600 transition-colors relative">
-                <div className="absolute left-1 top-1 w-3 h-3 bg-white rounded-full transition-transform peer-checked:translate-x-5" />
-              </div>
+              {renderSwitch(compactContext)}
             </label>
           </div>
           <div className="flex items-start justify-between gap-4 border border-gray-800 rounded-lg p-4 bg-gray-950/40">
@@ -690,9 +1143,7 @@ export default function Config() {
                 onChange={(e) => updateConfig(['agent', 'parallel_tools'], e.target.checked)}
                 className="sr-only peer"
               />
-              <div className="w-10 h-5 bg-gray-700 rounded-full peer peer-checked:bg-blue-600 transition-colors relative">
-                <div className="absolute left-1 top-1 w-3 h-3 bg-white rounded-full transition-transform peer-checked:translate-x-5" />
-              </div>
+              {renderSwitch(parallelTools)}
             </label>
           </div>
         </div>
@@ -775,9 +1226,7 @@ export default function Config() {
                 onChange={(e) => updateConfig(['gateway', 'require_pairing'], e.target.checked)}
                 className="sr-only peer"
               />
-              <div className="w-10 h-5 bg-gray-700 rounded-full peer peer-checked:bg-blue-600 transition-colors relative">
-                <div className="absolute left-1 top-1 w-3 h-3 bg-white rounded-full transition-transform peer-checked:translate-x-5" />
-              </div>
+              {renderSwitch(gatewayRequirePairing)}
             </label>
           </div>
           <div className="flex items-start justify-between gap-4 border border-gray-800 rounded-lg p-4 bg-gray-950/40">
@@ -807,493 +1256,56 @@ export default function Config() {
                 onChange={(e) => updateConfig(['gateway', 'allow_public_bind'], e.target.checked)}
                 className="sr-only peer"
               />
-              <div className="w-10 h-5 bg-gray-700 rounded-full peer peer-checked:bg-blue-600 transition-colors relative">
-                <div className="absolute left-1 top-1 w-3 h-3 bg-white rounded-full transition-transform peer-checked:translate-x-5" />
-              </div>
+              {renderSwitch(gatewayAllowPublicBind)}
             </label>
           </div>
-        </div>
-        )}
-
-        {activeTab === 'autonomy' && (
-        <div className="bg-gray-900 rounded-xl border border-gray-800 p-5 space-y-4">
-          <h3 className="text-sm font-semibold text-gray-200">
-            {t('config.form.autonomy_title')}
-          </h3>
-          <div>
-            <div className="flex items-center gap-2">
-              <label className="text-xs text-gray-400">
-                {t('config.form.autonomy_level_label')}
-              </label>
-              <button
-                type="button"
-                onClick={() => toggleHelp('autonomy_level')}
-                className="text-gray-500 hover:text-blue-400"
-              >
-                <HelpCircle className="h-4 w-4" />
-              </button>
-            </div>
-            {openHelp === 'autonomy_level' && (
-              <p className="text-xs text-gray-500 mt-2">
-                {t('config.form.autonomy_level_help')}
-              </p>
-            )}
-            <div className="relative">
-              <select
-                value={autonomyLevel}
-                onChange={(e) => updateConfig(['autonomy', 'level'], e.target.value)}
-                className={selectClassName}
-              >
-                <option value="read_only">{t('config.form.autonomy_level_read_only')}</option>
-                <option value="supervised">{t('config.form.autonomy_level_supervised')}</option>
-                <option value="full">{t('config.form.autonomy_level_full')}</option>
-              </select>
-              <ChevronDown className="pointer-events-none absolute right-3 top-1/2 h-4 w-4 -translate-y-1/2 text-gray-500" />
-            </div>
+          <div className="pt-2 border-t border-gray-800">
+            <h4 className="text-xs font-semibold uppercase tracking-wide text-gray-400">
+              {t('config.form.proxy_title')}
+            </h4>
           </div>
           <div className="flex items-start justify-between gap-4 border border-gray-800 rounded-lg p-4 bg-gray-950/40">
             <div>
-              <div className="flex items-center gap-2">
-                <span className="text-sm text-gray-200">
-                  {t('config.form.autonomy_workspace_only_label')}
-                </span>
-                <button
-                  type="button"
-                  onClick={() => toggleHelp('autonomy_workspace_only')}
-                  className="text-gray-500 hover:text-blue-400"
-                >
-                  <HelpCircle className="h-4 w-4" />
-                </button>
-              </div>
-              {openHelp === 'autonomy_workspace_only' && (
-                <p className="text-xs text-gray-500 mt-2">
-                  {t('config.form.autonomy_workspace_only_help')}
-                </p>
-              )}
+              <span className="text-sm text-gray-200">{t('config.form.proxy_enabled_label')}</span>
             </div>
             <label className="inline-flex items-center cursor-pointer">
               <input
                 type="checkbox"
-                checked={autonomyWorkspaceOnly}
-                onChange={(e) => updateConfig(['autonomy', 'workspace_only'], e.target.checked)}
+                checked={proxyEnabled}
+                onChange={(e) => updateConfig(['proxy', 'enabled'], e.target.checked)}
                 className="sr-only peer"
               />
-              <div className="w-10 h-5 bg-gray-700 rounded-full peer peer-checked:bg-blue-600 transition-colors relative">
-                <div className="absolute left-1 top-1 w-3 h-3 bg-white rounded-full transition-transform peer-checked:translate-x-5" />
-              </div>
+              {renderSwitch(proxyEnabled)}
             </label>
           </div>
           <div>
-            <div className="flex items-center gap-2">
-              <label className="text-xs text-gray-400">
-                {t('config.form.autonomy_allowed_commands_label')}
-              </label>
-              <button
-                type="button"
-                onClick={() => toggleHelp('autonomy_allowed_commands')}
-                className="text-gray-500 hover:text-blue-400"
-              >
-                <HelpCircle className="h-4 w-4" />
-              </button>
-            </div>
-            {openHelp === 'autonomy_allowed_commands' && (
-              <p className="text-xs text-gray-500 mt-2">
-                {t('config.form.autonomy_allowed_commands_help')}
-              </p>
-            )}
-            <textarea
-              value={allowedCommandsText}
-              onChange={(e) => setAllowedCommandsText(e.target.value)}
-              onBlur={() =>
-                updateConfig(['autonomy', 'allowed_commands'], parseList(allowedCommandsText))
-              }
-              className="mt-2 w-full min-h-[120px] rounded-lg bg-gray-950 border border-gray-800 px-3 py-2 text-sm text-gray-200 focus:outline-none focus:ring-2 focus:ring-blue-500"
-              spellCheck={false}
-              autoComplete="off"
-            />
-          </div>
-          <div>
-            <div className="flex items-center gap-2">
-              <label className="text-xs text-gray-400">
-                {t('config.form.autonomy_forbidden_paths_label')}
-              </label>
-              <button
-                type="button"
-                onClick={() => toggleHelp('autonomy_forbidden_paths')}
-                className="text-gray-500 hover:text-blue-400"
-              >
-                <HelpCircle className="h-4 w-4" />
-              </button>
-            </div>
-            {openHelp === 'autonomy_forbidden_paths' && (
-              <p className="text-xs text-gray-500 mt-2">
-                {t('config.form.autonomy_forbidden_paths_help')}
-              </p>
-            )}
-            <textarea
-              value={forbiddenPathsText}
-              onChange={(e) => setForbiddenPathsText(e.target.value)}
-              onBlur={() =>
-                updateConfig(['autonomy', 'forbidden_paths'], parseList(forbiddenPathsText))
-              }
-              className="mt-2 w-full min-h-[140px] rounded-lg bg-gray-950 border border-gray-800 px-3 py-2 text-sm text-gray-200 focus:outline-none focus:ring-2 focus:ring-blue-500"
-              spellCheck={false}
-              autoComplete="off"
-            />
-          </div>
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-            <div>
-              <label className="text-xs text-gray-400">
-                {t('config.form.autonomy_max_actions_label')}
-              </label>
-              <input
-                type="number"
-                value={autonomyMaxActionsPerHour}
-                onChange={(e) =>
-                  updateConfig(['autonomy', 'max_actions_per_hour'], Number(e.target.value))
-                }
-                className="mt-2 w-full rounded-lg bg-gray-950 border border-gray-800 px-3 py-2 text-sm text-gray-200 focus:outline-none focus:ring-2 focus:ring-blue-500"
-              />
-            </div>
-            <div>
-              <label className="text-xs text-gray-400">
-                {t('config.form.autonomy_max_cost_label')}
-              </label>
-              <input
-                type="number"
-                value={autonomyMaxCostPerDay}
-                onChange={(e) =>
-                  updateConfig(['autonomy', 'max_cost_per_day_cents'], Number(e.target.value))
-                }
-                className="mt-2 w-full rounded-lg bg-gray-950 border border-gray-800 px-3 py-2 text-sm text-gray-200 focus:outline-none focus:ring-2 focus:ring-blue-500"
-              />
-            </div>
-          </div>
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-            <div className="flex items-start justify-between gap-4 border border-gray-800 rounded-lg p-4 bg-gray-950/40">
-              <div>
-                <div className="flex items-center gap-2">
-                  <span className="text-sm text-gray-200">
-                    {t('config.form.autonomy_require_approval_label')}
-                  </span>
-                  <button
-                    type="button"
-                    onClick={() => toggleHelp('autonomy_require_approval')}
-                    className="text-gray-500 hover:text-blue-400"
-                  >
-                    <HelpCircle className="h-4 w-4" />
-                  </button>
-                </div>
-                {openHelp === 'autonomy_require_approval' && (
-                  <p className="text-xs text-gray-500 mt-2">
-                    {t('config.form.autonomy_require_approval_help')}
-                  </p>
-                )}
-              </div>
-              <label className="inline-flex items-center cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={autonomyRequireApproval}
-                  onChange={(e) =>
-                    updateConfig(['autonomy', 'require_approval_for_medium_risk'], e.target.checked)
-                  }
-                  className="sr-only peer"
-                />
-                <div className="w-10 h-5 bg-gray-700 rounded-full peer peer-checked:bg-blue-600 transition-colors relative">
-                  <div className="absolute left-1 top-1 w-3 h-3 bg-white rounded-full transition-transform peer-checked:translate-x-5" />
-                </div>
-              </label>
-            </div>
-            <div className="flex items-start justify-between gap-4 border border-gray-800 rounded-lg p-4 bg-gray-950/40">
-              <div>
-                <div className="flex items-center gap-2">
-                  <span className="text-sm text-gray-200">
-                    {t('config.form.autonomy_block_high_risk_label')}
-                  </span>
-                  <button
-                    type="button"
-                    onClick={() => toggleHelp('autonomy_block_high_risk')}
-                    className="text-gray-500 hover:text-blue-400"
-                  >
-                    <HelpCircle className="h-4 w-4" />
-                  </button>
-                </div>
-                {openHelp === 'autonomy_block_high_risk' && (
-                  <p className="text-xs text-gray-500 mt-2">
-                    {t('config.form.autonomy_block_high_risk_help')}
-                  </p>
-                )}
-              </div>
-              <label className="inline-flex items-center cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={autonomyBlockHighRisk}
-                  onChange={(e) =>
-                    updateConfig(['autonomy', 'block_high_risk_commands'], e.target.checked)
-                  }
-                  className="sr-only peer"
-                />
-                <div className="w-10 h-5 bg-gray-700 rounded-full peer peer-checked:bg-blue-600 transition-colors relative">
-                  <div className="absolute left-1 top-1 w-3 h-3 bg-white rounded-full transition-transform peer-checked:translate-x-5" />
-                </div>
-              </label>
-            </div>
-          </div>
-          <div>
-            <div className="flex items-center gap-2">
-              <label className="text-xs text-gray-400">
-                {t('config.form.autonomy_non_cli_excluded_tools_label')}
-              </label>
-              <button
-                type="button"
-                onClick={() => toggleHelp('autonomy_non_cli_excluded_tools')}
-                className="text-gray-500 hover:text-blue-400"
-              >
-                <HelpCircle className="h-4 w-4" />
-              </button>
-            </div>
-            {openHelp === 'autonomy_non_cli_excluded_tools' && (
-              <p className="text-xs text-gray-500 mt-2">
-                {t('config.form.autonomy_non_cli_excluded_tools_help')}
-              </p>
-            )}
-            <textarea
-              value={autonomyNonCliExcludedTools}
-              onChange={(e) =>
-                updateConfig(['autonomy', 'non_cli_excluded_tools'], parseList(e.target.value))
-              }
-              className="mt-2 w-full min-h-[100px] rounded-lg bg-gray-950 border border-gray-800 px-3 py-2 text-sm text-gray-200 focus:outline-none focus:ring-2 focus:ring-blue-500"
-              spellCheck={false}
-            />
-          </div>
-        </div>
-        )}
-
-        {activeTab === 'browser' && (
-        <div className="bg-gray-900 rounded-xl border border-gray-800 p-5 space-y-4">
-          <h3 className="text-sm font-semibold text-gray-200">
-            {t('config.form.browser_title')}
-          </h3>
-          <div className="flex items-start justify-between gap-4 border border-gray-800 rounded-lg p-4 bg-gray-950/40">
-            <div>
-              <div className="text-sm text-gray-200">
-                {t('config.form.browser_enabled_label')}
-              </div>
-              <p className="text-xs text-gray-500 mt-1">
-                {t('config.form.browser_enabled_help')}
-              </p>
-            </div>
-            <label className="inline-flex items-center cursor-pointer">
-              <input
-                type="checkbox"
-                checked={browserEnabled}
-                onChange={(e) => updateConfig(['browser', 'enabled'], e.target.checked)}
-                className="sr-only peer"
-              />
-              <div className="w-10 h-5 bg-gray-700 rounded-full peer peer-checked:bg-blue-600 transition-colors relative">
-                <div className="absolute left-1 top-1 w-3 h-3 bg-white rounded-full transition-transform peer-checked:translate-x-5" />
-              </div>
-            </label>
-          </div>
-          <div>
-            <div className="flex items-center gap-2">
-              <label className="text-xs text-gray-400">
-                {t('config.form.browser_allowed_domains_label')}
-              </label>
-              <button
-                type="button"
-                onClick={() => toggleHelp('browser_allowed_domains')}
-                className="text-gray-500 hover:text-blue-400"
-              >
-                <HelpCircle className="h-4 w-4" />
-              </button>
-            </div>
-            {openHelp === 'browser_allowed_domains' && (
-              <p className="text-xs text-gray-500 mt-2">
-                {t('config.form.browser_allowed_domains_help')}
-              </p>
-            )}
-            <textarea
-              value={browserAllowedDomainsText}
-              onChange={(e) => setBrowserAllowedDomainsText(e.target.value)}
-              onBlur={() =>
-                updateConfig(['browser', 'allowed_domains'], parseList(browserAllowedDomainsText))
-              }
-              className="mt-2 w-full min-h-[120px] rounded-lg bg-gray-950 border border-gray-800 px-3 py-2 text-sm text-gray-200 focus:outline-none focus:ring-2 focus:ring-blue-500"
-              spellCheck={false}
-              autoComplete="off"
-            />
-          </div>
-          <div>
-            <label className="text-xs text-gray-400">{t('config.form.browser_backend_label')}</label>
+            <label className="text-xs text-gray-400">{t('config.form.proxy_mode_label')}</label>
             <div className="relative">
               <select
-                value={browserBackend}
-                onChange={(e) => updateConfig(['browser', 'backend'], e.target.value)}
+                value={proxyMode}
+                onChange={(e) => {
+                  const mode = e.target.value;
+                  if (mode === 'direct') {
+                    updateConfig(['proxy', 'enabled'], false);
+                    return;
+                  }
+                  updateConfig(['proxy', 'enabled'], true);
+                  updateConfig(['proxy', 'scope'], 'environment');
+                }}
                 className={selectClassName}
               >
-                <option value="agent_browser">
-                  {t('config.form.browser_backend_agent_browser')}
-                </option>
-                <option value="rust_native">
-                  {t('config.form.browser_backend_rust_native')}
-                </option>
-                <option value="computer_use">
-                  {t('config.form.browser_backend_computer_use')}
-                </option>
-                <option value="auto">{t('config.form.browser_backend_auto')}</option>
+                <option value="direct">{t('config.form.proxy_mode_direct')}</option>
+                <option value="system">{t('config.form.proxy_mode_system')}</option>
               </select>
               <ChevronDown className="pointer-events-none absolute right-3 top-1/2 h-4 w-4 -translate-y-1/2 text-gray-500" />
             </div>
+            <p className="mt-2 text-xs text-gray-500">{t('config.form.proxy_mode_help')}</p>
+            {proxyEnabled && proxyScope !== 'environment' && (
+              <p className="mt-2 text-xs text-amber-400">
+                {t('config.form.proxy_mode_migrated_hint')}
+              </p>
+            )}
           </div>
-          {browserBackend === 'rust_native' && (
-            <>
-              <div>
-                <label className="text-xs text-gray-400">
-                  {t('config.form.browser_native_webdriver_label')}
-                </label>
-                <input
-                  value={browserNativeWebdriverUrl}
-                  onChange={(e) => updateConfig(['browser', 'native_webdriver_url'], e.target.value)}
-                  className="mt-2 w-full rounded-lg bg-gray-950 border border-gray-800 px-3 py-2 text-sm text-gray-200 focus:outline-none focus:ring-2 focus:ring-blue-500"
-                />
-              </div>
-              <div className="flex items-start justify-between gap-4 border border-gray-800 rounded-lg p-4 bg-gray-950/40">
-                <div>
-                  <div className="flex items-center gap-2">
-                    <span className="text-sm text-gray-200">
-                      {t('config.form.browser_native_headless_label')}
-                    </span>
-                    <button
-                      type="button"
-                      onClick={() => toggleHelp('browser_native_headless')}
-                      className="text-gray-500 hover:text-blue-400"
-                    >
-                      <HelpCircle className="h-4 w-4" />
-                    </button>
-                  </div>
-                  {openHelp === 'browser_native_headless' && (
-                    <p className="text-xs text-gray-500 mt-2">
-                      {t('config.form.browser_native_headless_help')}
-                    </p>
-                  )}
-                </div>
-                <label className="inline-flex items-center cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={browserNativeHeadless}
-                    onChange={(e) => updateConfig(['browser', 'native_headless'], e.target.checked)}
-                    className="sr-only peer"
-                  />
-                  <div className="w-10 h-5 bg-gray-700 rounded-full peer peer-checked:bg-blue-600 transition-colors relative">
-                    <div className="absolute left-1 top-1 w-3 h-3 bg-white rounded-full transition-transform peer-checked:translate-x-5" />
-                  </div>
-                </label>
-              </div>
-            </>
-          )}
-          {browserBackend === 'computer_use' && (
-            <>
-              <div className="flex items-start justify-between gap-4 border border-gray-800 rounded-lg p-4 bg-gray-950/40">
-                <div>
-                  <div className="flex items-center gap-2">
-                    <span className="text-sm text-gray-200">
-                      {t('config.form.computer_use_enabled_label')}
-                    </span>
-                    <button
-                      type="button"
-                      onClick={() => toggleHelp('computer_use_enabled')}
-                      className="text-gray-500 hover:text-blue-400"
-                    >
-                      <HelpCircle className="h-4 w-4" />
-                    </button>
-                  </div>
-                  {openHelp === 'computer_use_enabled' && (
-                    <p className="text-xs text-gray-500 mt-2">
-                      {t('config.form.computer_use_enabled_help')}
-                    </p>
-                  )}
-                </div>
-                <label className="inline-flex items-center cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={computerUseEnabled}
-                    onChange={(e) =>
-                      updateConfig(['browser', 'computer_use', 'enabled'], e.target.checked)
-                    }
-                    className="sr-only peer"
-                  />
-                  <div className="w-10 h-5 bg-gray-700 rounded-full peer peer-checked:bg-blue-600 transition-colors relative">
-                    <div className="absolute left-1 top-1 w-3 h-3 bg-white rounded-full transition-transform peer-checked:translate-x-5" />
-                  </div>
-                </label>
-              </div>
-              <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-                <div>
-                  <label className="text-xs text-gray-400">
-                    {t('config.form.computer_use_endpoint_label')}
-                  </label>
-                  <input
-                    value={computerUseEndpoint}
-                    onChange={(e) =>
-                      updateConfig(['browser', 'computer_use', 'endpoint'], e.target.value)
-                    }
-                    className="mt-2 w-full rounded-lg bg-gray-950 border border-gray-800 px-3 py-2 text-sm text-gray-200 focus:outline-none focus:ring-2 focus:ring-blue-500"
-                  />
-                </div>
-                <div>
-                  <label className="text-xs text-gray-400">
-                    {t('config.form.computer_use_timeout_label')}
-                  </label>
-                  <input
-                    type="number"
-                    value={computerUseTimeout}
-                    onChange={(e) =>
-                      updateConfig(['browser', 'computer_use', 'timeout_ms'], Number(e.target.value))
-                    }
-                    className="mt-2 w-full rounded-lg bg-gray-950 border border-gray-800 px-3 py-2 text-sm text-gray-200 focus:outline-none focus:ring-2 focus:ring-blue-500"
-                  />
-                </div>
-              </div>
-              <div className="flex items-start justify-between gap-4 border border-gray-800 rounded-lg p-4 bg-gray-950/40">
-                <div>
-                  <div className="flex items-center gap-2">
-                    <span className="text-sm text-gray-200">
-                      {t('config.form.computer_use_allow_remote_label')}
-                    </span>
-                    <button
-                      type="button"
-                      onClick={() => toggleHelp('computer_use_allow_remote')}
-                      className="text-gray-500 hover:text-blue-400"
-                    >
-                      <HelpCircle className="h-4 w-4" />
-                    </button>
-                  </div>
-                  {openHelp === 'computer_use_allow_remote' && (
-                    <p className="text-xs text-gray-500 mt-2">
-                      {t('config.form.computer_use_allow_remote_help')}
-                    </p>
-                  )}
-                </div>
-                <label className="inline-flex items-center cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={computerUseAllowRemote}
-                    onChange={(e) =>
-                      updateConfig(
-                        ['browser', 'computer_use', 'allow_remote_endpoint'],
-                        e.target.checked,
-                      )
-                    }
-                    className="sr-only peer"
-                  />
-                  <div className="w-10 h-5 bg-gray-700 rounded-full peer peer-checked:bg-blue-600 transition-colors relative">
-                    <div className="absolute left-1 top-1 w-3 h-3 bg-white rounded-full transition-transform peer-checked:translate-x-5" />
-                  </div>
-                </label>
-              </div>
-            </>
-          )}
         </div>
         )}
 
@@ -1395,9 +1407,7 @@ export default function Config() {
                   onChange={(e) => updateConfig(['memory', 'auto_save'], e.target.checked)}
                   className="sr-only peer"
                 />
-                <div className="w-10 h-5 bg-gray-700 rounded-full peer peer-checked:bg-blue-600 transition-colors relative">
-                  <div className="absolute left-1 top-1 w-3 h-3 bg-white rounded-full transition-transform peer-checked:translate-x-5" />
-                </div>
+                {renderSwitch(memoryAutoSave)}
               </label>
             </div>
             <div className="flex items-start justify-between gap-4 border border-gray-800 rounded-lg p-4 bg-gray-950/40">
@@ -1413,9 +1423,7 @@ export default function Config() {
                   onChange={(e) => updateConfig(['memory', 'hygiene_enabled'], e.target.checked)}
                   className="sr-only peer"
                 />
-                <div className="w-10 h-5 bg-gray-700 rounded-full peer peer-checked:bg-blue-600 transition-colors relative">
-                  <div className="absolute left-1 top-1 w-3 h-3 bg-white rounded-full transition-transform peer-checked:translate-x-5" />
-                </div>
+                {renderSwitch(memoryHygieneEnabled)}
               </label>
             </div>
           </div>
@@ -1438,9 +1446,7 @@ export default function Config() {
                 onChange={(e) => updateConfig(['web_search', 'enabled'], e.target.checked)}
                 className="sr-only peer"
               />
-              <div className="w-10 h-5 bg-gray-700 rounded-full peer peer-checked:bg-blue-600 transition-colors relative">
-                <div className="absolute left-1 top-1 w-3 h-3 bg-white rounded-full transition-transform peer-checked:translate-x-5" />
-              </div>
+              {renderSwitch(webSearchEnabled)}
             </label>
           </div>
           <div>
@@ -1489,9 +1495,7 @@ export default function Config() {
                 onChange={(e) => updateConfig(['cost', 'enabled'], e.target.checked)}
                 className="sr-only peer"
               />
-              <div className="w-10 h-5 bg-gray-700 rounded-full peer peer-checked:bg-blue-600 transition-colors relative">
-                <div className="absolute left-1 top-1 w-3 h-3 bg-white rounded-full transition-transform peer-checked:translate-x-5" />
-              </div>
+              {renderSwitch(costEnabled)}
             </label>
           </div>
           <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">

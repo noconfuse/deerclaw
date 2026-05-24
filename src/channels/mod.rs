@@ -68,6 +68,7 @@ pub use whatsapp::WhatsAppChannel;
 pub use whatsapp_web::WhatsAppWebChannel;
 
 use crate::agent::loop_::{build_tool_instructions, run_tool_call_loop, scrub_credentials};
+use crate::config::schema::ModelContextWindowCacheEntry;
 use crate::config::Config;
 use crate::identity;
 use crate::memory::{self, Memory};
@@ -85,7 +86,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio_util::sync::CancellationToken;
 
 /// Per-sender conversation history for channel messages.
@@ -173,6 +174,8 @@ struct ChannelRuntimeDefaults {
     api_key: Option<String>,
     api_url: Option<String>,
     reliability: crate::config::ReliabilityConfig,
+    model_context_windows: HashMap<String, ModelContextWindowCacheEntry>,
+    model_context_window_ttl_secs: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -572,6 +575,8 @@ fn runtime_defaults_from_config(config: &Config) -> ChannelRuntimeDefaults {
         api_key: config.api_key.clone(),
         api_url: config.api_url.clone(),
         reliability: config.reliability.clone(),
+        model_context_windows: config.agent.model_context_windows.clone(),
+        model_context_window_ttl_secs: config.agent.model_context_window_ttl_secs,
     }
 }
 
@@ -599,7 +604,40 @@ fn runtime_defaults_snapshot(ctx: &ChannelRuntimeContext) -> ChannelRuntimeDefau
         api_key: ctx.api_key.clone(),
         api_url: ctx.api_url.clone(),
         reliability: (*ctx.reliability).clone(),
+        model_context_windows: HashMap::new(),
+        model_context_window_ttl_secs: 604_800,
     }
+}
+
+fn normalized_model_context_window_cache_key(model: &str) -> Option<String> {
+    let key = model.trim().to_ascii_lowercase();
+    if key.is_empty() {
+        None
+    } else {
+        Some(key)
+    }
+}
+
+fn cached_model_context_window_tokens(
+    defaults: &ChannelRuntimeDefaults,
+    model: &str,
+) -> Option<usize> {
+    let key = normalized_model_context_window_cache_key(model)?;
+    let entry = defaults.model_context_windows.get(&key)?;
+    if entry.context_window_tokens == 0 {
+        return None;
+    }
+    let ttl_secs = defaults.model_context_window_ttl_secs;
+    if ttl_secs == 0 {
+        return Some(entry.context_window_tokens);
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs());
+    if now.saturating_sub(entry.updated_at_unix) > ttl_secs {
+        return None;
+    }
+    Some(entry.context_window_tokens)
 }
 
 async fn config_file_stamp(path: &Path) -> Option<ConfigFileStamp> {
@@ -1595,6 +1633,8 @@ async fn process_channel_message(
     let history_key = conversation_history_key(&msg);
     let route = get_route_selection(ctx.as_ref(), &history_key);
     let runtime_defaults = runtime_defaults_snapshot(ctx.as_ref());
+    let configured_context_window_tokens =
+        cached_model_context_window_tokens(&runtime_defaults, route.model.as_str());
     let active_provider = match get_or_create_provider(ctx.as_ref(), &route.provider).await {
         Ok(provider) => provider,
         Err(err) => {
@@ -1782,6 +1822,7 @@ async fn process_channel_message(
                 msg.channel.as_str(),
                 &ctx.multimodal,
                 ctx.max_tool_iterations,
+                configured_context_window_tokens,
                 Some(cancellation_token.clone()),
                 delta_tx,
                 ctx.hooks.as_deref(),
@@ -2223,11 +2264,22 @@ async fn run_message_dispatch_loop(
 }
 
 /// Load OpenClaw format bootstrap files into the prompt.
+fn shared_workspace_context_dir(workspace_dir: &std::path::Path) -> std::path::PathBuf {
+    let project_dir = workspace_dir.join(crate::gateway::SESSION_WORKSPACE_PROJECT_LINK);
+    if project_dir.is_dir() {
+        return project_dir;
+    }
+
+    workspace_dir.to_path_buf()
+}
+
+/// Load OpenClaw format bootstrap files into the prompt.
 fn load_openclaw_bootstrap_files(
     prompt: &mut String,
     workspace_dir: &std::path::Path,
     max_chars_per_file: usize,
 ) {
+    let context_dir = shared_workspace_context_dir(workspace_dir);
     prompt.push_str(
         "The following workspace files define your identity, behavior, and context. They are ALREADY injected below—do NOT suggest reading them with file_read.\n\n",
     );
@@ -2235,17 +2287,17 @@ fn load_openclaw_bootstrap_files(
     let bootstrap_files = ["AGENTS.md", "SOUL.md", "TOOLS.md", "IDENTITY.md", "USER.md"];
 
     for filename in &bootstrap_files {
-        inject_workspace_file(prompt, workspace_dir, filename, max_chars_per_file);
+        inject_workspace_file(prompt, &context_dir, filename, max_chars_per_file);
     }
 
     // BOOTSTRAP.md — only if it exists (first-run ritual)
-    let bootstrap_path = workspace_dir.join("BOOTSTRAP.md");
+    let bootstrap_path = context_dir.join("BOOTSTRAP.md");
     if bootstrap_path.exists() {
-        inject_workspace_file(prompt, workspace_dir, "BOOTSTRAP.md", max_chars_per_file);
+        inject_workspace_file(prompt, &context_dir, "BOOTSTRAP.md", max_chars_per_file);
     }
 
     // MEMORY.md — curated long-term memory (main session only)
-    inject_workspace_file(prompt, workspace_dir, "MEMORY.md", max_chars_per_file);
+    inject_workspace_file(prompt, &context_dir, "MEMORY.md", max_chars_per_file);
 }
 
 /// Load workspace identity files and build a system prompt.
@@ -2296,6 +2348,7 @@ pub fn build_system_prompt_with_mode(
 ) -> String {
     use std::fmt::Write;
     let mut prompt = String::with_capacity(8192);
+    let context_dir = shared_workspace_context_dir(workspace_dir);
 
     // ── 1. Tooling ──────────────────────────────────────────────
     if !tools.is_empty() {
@@ -2379,7 +2432,7 @@ pub fn build_system_prompt_with_mode(
     if let Some(config) = identity_config {
         if identity::is_aieos_configured(config) {
             // Load AIEOS identity
-            match identity::load_aieos_identity(config, workspace_dir) {
+            match identity::load_aieos_identity(config, &context_dir) {
                 Ok(Some(aieos_identity)) => {
                     let aieos_prompt = identity::aieos_to_system_prompt(&aieos_identity);
                     if !aieos_prompt.is_empty() {
@@ -3062,13 +3115,14 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
 #[allow(clippy::too_many_lines)]
 pub async fn start_channels(config: Config) -> Result<()> {
     let provider_name = resolved_default_provider(&config);
-    let cost_tracker = match crate::cost::CostTracker::new(config.cost.clone(), &config.workspace_dir) {
-        Ok(ct) => Some(Arc::new(ct)),
-        Err(e) => {
-            tracing::warn!("Failed to initialize cost tracker: {e}");
-            None
-        }
-    };
+    let cost_tracker =
+        match crate::cost::CostTracker::new(config.cost.clone(), &config.workspace_dir) {
+            Ok(ct) => Some(Arc::new(ct)),
+            Err(e) => {
+                tracing::warn!("Failed to initialize cost tracker: {e}");
+                None
+            }
+        };
     let provider_runtime_options = providers::ProviderRuntimeOptions {
         auth_profile_override: None,
         provider_api_url: config.api_url.clone(),
@@ -3179,6 +3233,30 @@ pub async fn start_channels(config: Config) -> Result<()> {
             "Read file contents. Use when: inspecting project files, configs, logs. Don't use when: a targeted search is enough.",
         ),
         (
+            "pdf_read",
+            "Extract text from PDF files. Prefer this over shell/file_read for user-provided PDFs when readable text is needed.",
+        ),
+        (
+            "office_read",
+            "Read DOCX, PPTX, and XLSX files through OfficeCLI. Prefer this over shell/file_read for Office documents; use text for extraction and json for structured inspection.",
+        ),
+        (
+            "office_create",
+            "Create blank DOCX, PPTX, and XLSX files through bundled OfficeCLI. Prefer this over shell scripts or installing Office libraries when a user asks to generate a new Office document.",
+        ),
+        (
+            "office_query",
+            "Query Office document structure through OfficeCLI selectors before editing existing DOCX, PPTX, or XLSX files.",
+        ),
+        (
+            "office_set",
+            "Modify existing DOCX, PPTX, and XLSX elements through OfficeCLI set --prop. Prefer this over shell-based XML/Python generation for Office edits.",
+        ),
+        (
+            "office_add",
+            "Add slides, shapes, paragraphs, rows, cells, charts, and other Office elements through OfficeCLI add. Prefer this over shell-based Office generation when creating content inside an Office file.",
+        ),
+        (
             "file_write",
             "Write file contents. Use when: applying focused edits, scaffolding files, updating docs/code. Don't use when: side effects are unclear or file ownership is uncertain.",
         ),
@@ -3196,10 +3274,10 @@ pub async fn start_channels(config: Config) -> Result<()> {
         ),
     ];
 
-    if config.browser.enabled {
+    if config.browser.enabled && config.browser.open_tool_enabled {
         tool_descs.push((
             "browser_open",
-            "Open approved HTTPS URLs in system browser (allowlist-only, no scraping)",
+            "Open approved HTTPS URLs in system browser only for user-visible browsing; avoid when browser automation/scraping is needed.",
         ));
     }
     if config.composio.enabled {
@@ -4640,6 +4718,8 @@ BTC is currently around $65,000 based on latest tool output."#
                         api_key: None,
                         api_url: None,
                         reliability: crate::config::ReliabilityConfig::default(),
+                        model_context_windows: HashMap::new(),
+                        model_context_window_ttl_secs: 604_800,
                     },
                     last_applied_stamp: None,
                 },
@@ -5353,6 +5433,30 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[test]
+    fn prompt_can_surface_office_read_tool() {
+        let ws = make_workspace();
+        let tools = vec![("office_read", "Read Office files via OfficeCLI")];
+        let prompt = build_system_prompt(ws.path(), "gpt-4o", &tools, &[], None, None);
+
+        assert!(prompt.contains("**office_read**"));
+    }
+
+    #[test]
+    fn prompt_can_surface_office_write_tools() {
+        let ws = make_workspace();
+        let tools = vec![
+            ("office_create", "Create Office files via OfficeCLI"),
+            ("office_set", "Edit Office files via OfficeCLI"),
+            ("office_add", "Add Office elements via OfficeCLI"),
+        ];
+        let prompt = build_system_prompt(ws.path(), "gpt-4o", &tools, &[], None, None);
+
+        assert!(prompt.contains("**office_create**"));
+        assert!(prompt.contains("**office_set**"));
+        assert!(prompt.contains("**office_add**"));
+    }
+
+    #[test]
     fn prompt_includes_single_tool_protocol_block_after_append() {
         let ws = make_workspace();
         let tools = vec![("shell", "Run commands")];
@@ -5462,6 +5566,28 @@ BTC is currently around $65,000 based on latest tool output."#
             !prompt.contains("Some note"),
             "daily content should not be in prompt"
         );
+    }
+
+    #[test]
+    fn session_workspace_prompt_uses_shared_project_context() {
+        let base = make_workspace();
+        let session = TempDir::new().unwrap();
+        std::fs::create_dir_all(session.path().join("state")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(base.path(), session.path().join("project")).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(base.path(), session.path().join("project")).unwrap();
+
+        let prompt = build_system_prompt(session.path(), "model", &[], &[], None, None);
+
+        assert!(prompt.contains("### SOUL.md"));
+        assert!(prompt.contains("Be helpful"));
+        assert!(prompt.contains("### MEMORY.md"));
+        assert!(prompt.contains("User likes Rust"));
+        assert!(prompt.contains(&format!(
+            "Working directory: `{}`",
+            session.path().display()
+        )));
     }
 
     #[test]

@@ -1,5 +1,5 @@
 use super::traits::{Tool, ToolResult};
-use crate::security::SecurityPolicy;
+use crate::security::{SecurityPolicy, policy::ToolOperation};
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
@@ -46,6 +46,10 @@ impl Tool for FileReadTool {
             },
             "required": ["path"]
         })
+    }
+
+    fn operation(&self, _args: &serde_json::Value) -> ToolOperation {
+        ToolOperation::Read
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
@@ -249,12 +253,10 @@ mod tests {
     fn test_security_with(
         workspace: std::path::PathBuf,
         autonomy: AutonomyLevel,
-        max_actions_per_hour: u32,
     ) -> Arc<SecurityPolicy> {
         Arc::new(SecurityPolicy {
             autonomy,
             workspace_dir: workspace,
-            max_actions_per_hour,
             ..SecurityPolicy::default()
         })
     }
@@ -368,19 +370,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn file_read_allows_readonly_mode() {
-        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_readonly");
+    async fn file_read_allows_supervised_mode() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_supervised");
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await.unwrap();
-        tokio::fs::write(dir.join("test.txt"), "readonly ok")
+        tokio::fs::write(dir.join("test.txt"), "supervised ok")
             .await
             .unwrap();
 
-        let tool = FileReadTool::new(test_security_with(dir.clone(), AutonomyLevel::ReadOnly, 20));
+        let tool = FileReadTool::new(test_security_with(dir.clone(), AutonomyLevel::Supervised, 20));
         let result = tool.execute(json!({"path": "test.txt"})).await.unwrap();
 
         assert!(result.success);
-        assert!(result.output.contains("1: readonly ok"));
+        assert!(result.output.contains("1: supervised ok"));
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }

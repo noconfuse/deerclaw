@@ -11,6 +11,7 @@ import {
 import type { CronJob } from '@/types/api';
 import { getCronJobs, addCronJob, deleteCronJob } from '@/lib/api';
 import { useTranslation } from 'react-i18next';
+import { useNotify } from '@/hooks/useNotify';
 
 function formatDate(iso: string | null): string {
   if (!iso) return '-';
@@ -20,6 +21,7 @@ function formatDate(iso: string | null): string {
 
 export default function Cron() {
   const { t } = useTranslation();
+  const notify = useNotify();
   const [jobs, setJobs] = useState<CronJob[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -37,7 +39,11 @@ export default function Cron() {
     setLoading(true);
     getCronJobs()
       .then(setJobs)
-      .catch((err) => setError(err.message))
+      .catch((err) => {
+        const message = err instanceof Error ? err.message : t('cron.load_failed');
+        setError(message);
+        notify.error(message, { key: 'cron:load' });
+      })
       .finally(() => setLoading(false));
   };
 
@@ -64,7 +70,9 @@ export default function Cron() {
       setFormSchedule('');
       setFormCommand('');
     } catch (err: unknown) {
-      setFormError(err instanceof Error ? err.message : t('cron.add_failed'));
+      const message = err instanceof Error ? err.message : t('cron.add_failed');
+      setFormError(message);
+      notify.error(message, { key: 'cron:add:error' });
     } finally {
       setSubmitting(false);
     }
@@ -75,7 +83,9 @@ export default function Cron() {
       await deleteCronJob(id);
       setJobs((prev) => prev.filter((j) => j.id !== id));
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : t('cron.delete_failed'));
+      const message = err instanceof Error ? err.message : t('cron.delete_failed');
+      setError(message);
+      notify.error(message, { key: 'cron:delete:error' });
     } finally {
       setConfirmDelete(null);
     }

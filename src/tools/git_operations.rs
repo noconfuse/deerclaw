@@ -1,5 +1,5 @@
 use super::traits::{Tool, ToolResult};
-use crate::security::{AutonomyLevel, SecurityPolicy};
+use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
@@ -57,8 +57,8 @@ impl GitOperationsTool {
         )
     }
 
-    /// Check if an operation is read-only
-    fn is_read_only(&self, operation: &str) -> bool {
+    /// Check if an operation is non-mutating.
+    fn is_non_mutating_operation(&self, operation: &str) -> bool {
         matches!(
             operation,
             "status" | "diff" | "log" | "show" | "branch" | "rev-parse"
@@ -514,32 +514,8 @@ impl Tool for GitOperationsTool {
             }
         }
 
-        // Check autonomy level for write operations
-        if self.requires_write_access(operation) {
-            if !self.security.can_act() {
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(
-                        "Action blocked: git write operations require higher autonomy level".into(),
-                    ),
-                });
-            }
-
-            match self.security.autonomy {
-                AutonomyLevel::ReadOnly => {
-                    return Ok(ToolResult {
-                        success: false,
-                        output: String::new(),
-                        error: Some("Action blocked: read-only mode".into()),
-                    });
-                }
-                AutonomyLevel::Supervised | AutonomyLevel::Full => {}
-            }
-        }
-
-        // Record action for rate limiting
-        if !self.security.record_action() {
+        // Record action for write operations to enforce the action budget.
+        if self.requires_write_access(operation) && !self.security.record_action() {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -569,7 +545,7 @@ impl Tool for GitOperationsTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::security::SecurityPolicy;
+    use crate::security::{AutonomyLevel, SecurityPolicy};
     use tempfile::TempDir;
 
     fn test_tool(dir: &std::path::Path) -> GitOperationsTool {
@@ -671,102 +647,25 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let tool = test_tool(tmp.path());
 
-        // Branch listing is read-only; it must not require write access
+        // Branch listing is non-mutating; it must not require write access.
         assert!(!tool.requires_write_access("branch"));
-        assert!(tool.is_read_only("branch"));
+        assert!(tool.is_non_mutating_operation("branch"));
     }
 
     #[test]
-    fn is_read_only_detection() {
+    fn detects_non_mutating_operations() {
         let tmp = TempDir::new().unwrap();
         let tool = test_tool(tmp.path());
 
-        assert!(tool.is_read_only("status"));
-        assert!(tool.is_read_only("diff"));
-        assert!(tool.is_read_only("log"));
-        assert!(tool.is_read_only("branch"));
+        assert!(tool.is_non_mutating_operation("status"));
+        assert!(tool.is_non_mutating_operation("diff"));
+        assert!(tool.is_non_mutating_operation("log"));
+        assert!(tool.is_non_mutating_operation("branch"));
 
-        assert!(!tool.is_read_only("commit"));
-        assert!(!tool.is_read_only("add"));
+        assert!(!tool.is_non_mutating_operation("commit"));
+        assert!(!tool.is_non_mutating_operation("add"));
     }
 
-    #[tokio::test]
-    async fn blocks_readonly_mode_for_write_ops() {
-        let tmp = TempDir::new().unwrap();
-        // Initialize a git repository
-        std::process::Command::new("git")
-            .args(["init"])
-            .current_dir(tmp.path())
-            .output()
-            .unwrap();
-
-        let security = Arc::new(SecurityPolicy {
-            autonomy: AutonomyLevel::ReadOnly,
-            ..SecurityPolicy::default()
-        });
-        let tool = GitOperationsTool::new(security, tmp.path().to_path_buf());
-
-        let result = tool
-            .execute(json!({"operation": "commit", "message": "test"}))
-            .await
-            .unwrap();
-        assert!(!result.success);
-        // can_act() returns false for ReadOnly, so we get the "higher autonomy level" message
-        assert!(result
-            .error
-            .as_deref()
-            .unwrap_or("")
-            .contains("higher autonomy"));
-    }
-
-    #[tokio::test]
-    async fn allows_branch_listing_in_readonly_mode() {
-        let tmp = TempDir::new().unwrap();
-        // Initialize a git repository so the command can succeed
-        std::process::Command::new("git")
-            .args(["init"])
-            .current_dir(tmp.path())
-            .output()
-            .unwrap();
-
-        let security = Arc::new(SecurityPolicy {
-            autonomy: AutonomyLevel::ReadOnly,
-            ..SecurityPolicy::default()
-        });
-        let tool = GitOperationsTool::new(security, tmp.path().to_path_buf());
-
-        let result = tool.execute(json!({"operation": "branch"})).await.unwrap();
-        // Branch listing must not be blocked by read-only autonomy
-        let error_msg = result.error.as_deref().unwrap_or("");
-        assert!(
-            !error_msg.contains("read-only") && !error_msg.contains("higher autonomy"),
-            "branch listing should not be blocked in read-only mode, got: {error_msg}"
-        );
-    }
-
-    #[tokio::test]
-    async fn allows_readonly_ops_in_readonly_mode() {
-        let tmp = TempDir::new().unwrap();
-        let security = Arc::new(SecurityPolicy {
-            autonomy: AutonomyLevel::ReadOnly,
-            ..SecurityPolicy::default()
-        });
-        let tool = GitOperationsTool::new(security, tmp.path().to_path_buf());
-
-        // This will fail because there's no git repo, but it shouldn't be blocked by autonomy
-        let result = tool.execute(json!({"operation": "status"})).await.unwrap();
-        // The error should be about git (not about autonomy/read-only mode)
-        assert!(!result.success, "Expected failure due to missing git repo");
-        let error_msg = result.error.as_deref().unwrap_or("");
-        assert!(
-            !error_msg.is_empty(),
-            "Expected a git-related error message"
-        );
-        assert!(
-            !error_msg.contains("read-only") && !error_msg.contains("autonomy"),
-            "Error should be about git, not about autonomy restrictions: {error_msg}"
-        );
-    }
 
     #[tokio::test]
     async fn rejects_missing_operation() {

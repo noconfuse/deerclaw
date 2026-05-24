@@ -1,13 +1,13 @@
+use crate::cost::CostTracker;
 use crate::providers::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
     Provider, TokenUsage, ToolCall as ProviderToolCall,
 };
 use crate::tools::ToolSpec;
-use crate::cost::CostTracker;
-use std::sync::Arc;
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 pub struct OpenAiProvider {
     base_url: String,
@@ -76,9 +76,9 @@ struct NativeMessage {
     tool_call_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<NativeToolCall>>,
-    /// Raw reasoning content from thinking models; pass-through for providers
-    /// that require it in assistant tool-call history messages.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Keep locally for parsed history compatibility, but never send it back to
+    /// OpenAI-compatible providers because many endpoints reject unknown fields.
+    #[serde(skip_serializing)]
     reasoning_content: Option<String>,
 }
 
@@ -233,16 +233,12 @@ impl OpenAiProvider {
                                     .get("content")
                                     .and_then(serde_json::Value::as_str)
                                     .map(ToString::to_string);
-                                let reasoning_content = value
-                                    .get("reasoning_content")
-                                    .and_then(serde_json::Value::as_str)
-                                    .map(ToString::to_string);
                                 return NativeMessage {
                                     role: "assistant".to_string(),
                                     content,
                                     tool_call_id: None,
                                     tool_calls: Some(tool_calls),
-                                    reasoning_content,
+                                    reasoning_content: None,
                                 };
                             }
                         }
@@ -801,7 +797,7 @@ mod tests {
     }
 
     #[test]
-    fn convert_messages_round_trips_reasoning_content() {
+    fn convert_messages_ignores_reasoning_content_in_history() {
         use crate::providers::ChatMessage;
 
         let history_json = serde_json::json!({
@@ -817,10 +813,7 @@ mod tests {
         let messages = vec![ChatMessage::assistant(history_json.to_string())];
         let native = OpenAiProvider::convert_messages(&messages);
         assert_eq!(native.len(), 1);
-        assert_eq!(
-            native[0].reasoning_content.as_deref(),
-            Some("Let me think...")
-        );
+        assert!(native[0].reasoning_content.is_none());
     }
 
     #[test]
@@ -856,7 +849,7 @@ mod tests {
     }
 
     #[test]
-    fn native_message_includes_reasoning_content_when_some() {
+    fn native_message_never_serializes_reasoning_content() {
         let msg = NativeMessage {
             role: "assistant".to_string(),
             content: Some("hi".to_string()),
@@ -865,7 +858,6 @@ mod tests {
             reasoning_content: Some("thinking...".to_string()),
         };
         let json = serde_json::to_string(&msg).unwrap();
-        assert!(json.contains("reasoning_content"));
-        assert!(json.contains("thinking..."));
+        assert!(!json.contains("reasoning_content"));
     }
 }

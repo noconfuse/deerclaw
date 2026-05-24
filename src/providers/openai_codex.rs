@@ -641,11 +641,7 @@ impl OpenAiCodexProvider {
 
         if let Some(ref tracker) = self.cost_tracker {
             let output_tokens = (response_text.len() as u64 + 3) / 4;
-            if let Err(e) = tracker.record_usage_with_model(
-                model,
-                input_tokens,
-                output_tokens,
-            ) {
+            if let Err(e) = tracker.record_usage_with_model(model, input_tokens, output_tokens) {
                 tracing::warn!("Failed to record cost for {}: {}", model, e);
             }
         }

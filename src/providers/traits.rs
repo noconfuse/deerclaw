@@ -117,10 +117,22 @@ pub enum ConversationMessage {
 }
 
 /// A chunk of content from a streaming response.
+#[derive(Debug, Clone, Default)]
+pub struct StreamToolCallDelta {
+    pub index: usize,
+    pub id: Option<String>,
+    pub name: Option<String>,
+    pub arguments_delta: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct StreamChunk {
     /// Text delta for this chunk.
     pub delta: String,
+    /// Reasoning/thinking delta for this chunk.
+    pub reasoning_delta: Option<String>,
+    /// Tool-call delta fragments for this chunk.
+    pub tool_call_deltas: Vec<StreamToolCallDelta>,
     /// Whether this is the final chunk.
     pub is_final: bool,
     /// Approximate token count for this chunk (estimated).
@@ -132,6 +144,29 @@ impl StreamChunk {
     pub fn delta(text: impl Into<String>) -> Self {
         Self {
             delta: text.into(),
+            reasoning_delta: None,
+            tool_call_deltas: Vec::new(),
+            is_final: false,
+            token_count: 0,
+        }
+    }
+
+    /// Create a new non-final reasoning chunk.
+    pub fn reasoning_delta(text: impl Into<String>) -> Self {
+        Self {
+            delta: String::new(),
+            reasoning_delta: Some(text.into()),
+            tool_call_deltas: Vec::new(),
+            is_final: false,
+            token_count: 0,
+        }
+    }
+
+    pub fn tool_call_delta(tool_call_delta: StreamToolCallDelta) -> Self {
+        Self {
+            delta: String::new(),
+            reasoning_delta: None,
+            tool_call_deltas: vec![tool_call_delta],
             is_final: false,
             token_count: 0,
         }
@@ -141,6 +176,8 @@ impl StreamChunk {
     pub fn final_chunk() -> Self {
         Self {
             delta: String::new(),
+            reasoning_delta: None,
+            tool_call_deltas: Vec::new(),
             is_final: true,
             token_count: 0,
         }
@@ -150,6 +187,8 @@ impl StreamChunk {
     pub fn error(message: impl Into<String>) -> Self {
         Self {
             delta: message.into(),
+            reasoning_delta: None,
+            tool_call_deltas: Vec::new(),
             is_final: true,
             token_count: 0,
         }
@@ -163,12 +202,21 @@ impl StreamChunk {
 }
 
 /// Options for streaming chat requests.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct StreamOptions {
     /// Whether to enable streaming (default: true).
     pub enabled: bool,
     /// Whether to include token counts in chunks.
     pub count_tokens: bool,
+}
+
+impl Default for StreamOptions {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            count_tokens: false,
+        }
+    }
 }
 
 impl StreamOptions {
@@ -451,6 +499,23 @@ pub trait Provider: Send + Sync {
         let chunk = StreamChunk::error(format!("{} does not support streaming", provider_name));
         stream::once(async move { Ok(chunk) }).boxed()
     }
+
+    /// Streaming chat with full request context, including tools.
+    fn stream_chat(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: f64,
+        options: StreamOptions,
+    ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+        if request.tools.is_none() {
+            return self.stream_chat_with_history(request.messages, model, temperature, options);
+        }
+
+        let provider_name = "unknown".to_string();
+        let chunk = StreamChunk::error(format!("{} does not support streaming", provider_name));
+        stream::once(async move { Ok(chunk) }).boxed()
+    }
 }
 
 /// Build tool instructions text for prompt-guided tool calling.
@@ -558,6 +623,13 @@ mod tests {
         let usage = TokenUsage::default();
         assert!(usage.input_tokens.is_none());
         assert!(usage.output_tokens.is_none());
+    }
+
+    #[test]
+    fn stream_options_default_enables_streaming() {
+        let options = StreamOptions::default();
+        assert!(options.enabled);
+        assert!(!options.count_tokens);
     }
 
     #[test]

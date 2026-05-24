@@ -2,7 +2,9 @@ import { useState, type FormEvent } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Sparkles, CheckCircle, AlertTriangle, ChevronRight, ChevronDown, Server, Globe, Zap, Box, Code, Cpu } from 'lucide-react';
 import { onboardInit } from '@/lib/api';
+import { CHANNEL_DEFS, CHANNEL_LABEL_MAP } from '@/lib/channels';
 import { Logo } from '@/components/ui/Logo';
+import { useNotify } from '@/hooks/useNotify';
 
 type ProviderDef = {
   id: string;
@@ -128,7 +130,7 @@ const TIERS: TierDef[] = [
       {
         id: 'custom',
         label: 'Custom Provider',
-        requiresApiKey: false, // Optional for custom
+        requiresApiKey: true,
         requiresUrl: true,
         defaultUrl: '',
         urlLabel: 'API Base URL',
@@ -136,38 +138,6 @@ const TIERS: TierDef[] = [
     ]
   }
 ];
-
-type ChannelDef = {
-  id: string;
-  label: string;
-  description: string;
-  template: Record<string, unknown>;
-};
-
-const CHANNEL_DEFS: ChannelDef[] = [
-  { id: 'telegram', label: 'Telegram', description: 'Telegram bot', template: { bot_token: '', allowed_users: [], stream_mode: 'partial', draft_update_interval_ms: 1000, interrupt_on_new_message: true, mention_only: false } },
-  { id: 'discord', label: 'Discord', description: 'Discord bot', template: { bot_token: '', guild_id: '', allowed_users: [], listen_to_bots: false, mention_only: true } },
-  { id: 'slack', label: 'Slack', description: 'Slack app bot', template: { bot_token: '', app_token: '', channel_id: '', allowed_users: [] } },
-  { id: 'mattermost', label: 'Mattermost', description: 'Mattermost bot', template: { url: 'https://mattermost.example.com', bot_token: '', channel_id: '', allowed_users: [], thread_replies: true, mention_only: false } },
-  { id: 'webhook', label: 'Webhook', description: 'HTTP inbound webhook', template: { port: 8787, secret: '' } },
-  { id: 'imessage', label: 'iMessage', description: 'macOS iMessage bridge', template: { allowed_contacts: [] } },
-  { id: 'matrix', label: 'Matrix', description: 'Matrix bot', template: { homeserver: 'https://matrix.org', access_token: '', user_id: '', device_id: '', room_id: '', allowed_users: [] } },
-  { id: 'signal', label: 'Signal', description: 'signal-cli HTTP daemon', template: { http_url: 'http://127.0.0.1:8686', account: '+1234567890', group_id: '', allowed_from: ['*'], ignore_attachments: false, ignore_stories: false } },
-  { id: 'whatsapp', label: 'WhatsApp', description: 'Cloud API or Web mode', template: { access_token: '', phone_number_id: '', verify_token: '', app_secret: '', session_path: '', pair_phone: '', pair_code: '', allowed_numbers: ['*'] } },
-  { id: 'linq', label: 'Linq', description: 'Linq Partner API', template: { api_token: '', from_phone: '+1234567890', signing_secret: '', allowed_senders: ['*'] } },
-  { id: 'wati', label: 'WATI', description: 'WATI Business API', template: { api_token: '', api_url: 'https://live-mt-server.wati.io', tenant_id: '', allowed_numbers: ['*'] } },
-  { id: 'nextcloud_talk', label: 'Nextcloud Talk', description: 'Nextcloud Talk bot', template: { base_url: 'https://cloud.example.com', app_token: '', webhook_secret: '', allowed_users: ['*'] } },
-  { id: 'email', label: 'Email', description: 'IMAP/SMTP channel', template: { imap_host: 'imap.example.com', imap_port: 993, imap_folder: 'INBOX', smtp_host: 'smtp.example.com', smtp_port: 465, smtp_tls: true, username: '', password: '', from_address: 'bot@example.com', idle_timeout_secs: 1740, allowed_senders: ['*'] } },
-  { id: 'irc', label: 'IRC', description: 'IRC bot', template: { server: 'irc.libera.chat', port: 6697, nickname: 'zeroclaw-bot', username: 'zeroclaw', channels: ['#general'], allowed_users: ['*'], server_password: '', nickserv_password: '', sasl_password: '', verify_tls: true } },
-  { id: 'lark', label: 'Lark', description: 'Lark international bot', template: { app_id: '', app_secret: '', encrypt_key: '', verification_token: '', allowed_users: ['*'], mention_only: true, use_feishu: false, receive_mode: 'websocket', port: null } },
-  { id: 'feishu', label: 'Feishu', description: 'Feishu CN bot', template: { app_id: '', app_secret: '', encrypt_key: '', verification_token: '', allowed_users: ['*'], receive_mode: 'websocket', port: null } },
-  { id: 'dingtalk', label: 'DingTalk', description: 'DingTalk stream mode', template: { client_id: '', client_secret: '', allowed_users: ['*'] } },
-  { id: 'qq', label: 'QQ Official Bot', description: 'Tencent QQ bot', template: { app_id: '', app_secret: '', allowed_users: ['*'] } },
-  { id: 'nostr', label: 'Nostr', description: 'Nostr private messages', template: { private_key: '', relays: ['wss://relay.damus.io'], allowed_pubkeys: ['*'] } },
-  { id: 'clawdtalk', label: 'ClawdTalk', description: 'Telnyx SIP voice channel', template: { api_key: '', connection_id: '', from_number: '+1234567890', allowed_destinations: ['*'], webhook_secret: '' } },
-];
-
-const CHANNEL_LABEL_MAP = Object.fromEntries(CHANNEL_DEFS.map((channel) => [channel.id, channel.label])) as Record<string, string>;
 
 const MEMORY_BACKENDS = [
   { id: 'sqlite' },
@@ -398,6 +368,7 @@ function Stepper({ currentStep, onStepClick }: { currentStep: string; onStepClic
 
 export default function Onboard() {
   const { t } = useTranslation();
+  const notify = useNotify();
   const [step, setStep] = useState<'tier' | 'provider' | 'provider_config' | 'identity' | 'memory' | 'features' | 'hardware' | 'channels' | 'config'>('tier');
   const [selectedTier, setSelectedTier] = useState<TierDef>(TIERS[0] as TierDef);
   const [selectedProvider, setSelectedProvider] = useState<ProviderDef>(TIERS[0]?.providers[0] as ProviderDef);
@@ -435,7 +406,7 @@ export default function Onboard() {
   const [toolMode, setToolMode] = useState<'sovereign' | 'composio'>('sovereign');
   const [composioApiKey, setComposioApiKey] = useState('');
   const [encryptSecrets, setEncryptSecrets] = useState(false);
-  const [autonomyLevel, setAutonomyLevel] = useState<'read_only' | 'supervised' | 'full'>('read_only');
+  const [autonomyLevel, setAutonomyLevel] = useState<'supervised' | 'full'>('supervised');
   const [enableTunnel, setEnableTunnel] = useState(false);
   const [tunnelProvider, setTunnelProvider] = useState<'cloudflare' | 'ngrok' | 'tailscale' | 'custom'>('cloudflare');
   const [tunnelToken, setTunnelToken] = useState('');
@@ -446,6 +417,7 @@ export default function Onboard() {
 
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const providerRequiresApiKey = selectedProvider.requiresApiKey || selectedTier.id === 'custom';
 
   const parseChannelConfig = (channelId: string): Record<string, unknown> | null => {
     try {
@@ -501,6 +473,19 @@ export default function Onboard() {
 
   const handleProviderConfigSubmit = (e: FormEvent) => {
     e.preventDefault();
+    if ((selectedProvider.requiresUrl || selectedTier.id === 'custom') && !apiUrl.trim()) {
+      setError(t('onboard.config.endpoint.required'));
+      return;
+    }
+    if (providerRequiresApiKey && !apiKey.trim()) {
+      setError(t('onboard.config.apikey.required'));
+      return;
+    }
+    if (!model.trim()) {
+      setError(t('onboard.config.model.required'));
+      return;
+    }
+    setError(null);
     setStep('identity');
   };
 
@@ -551,8 +536,10 @@ export default function Onboard() {
       // For custom provider, the ID is "custom:{url}"
       let providerId = selectedProvider.id;
       if (selectedTier.id === 'custom') {
-        if (!apiUrl) throw new Error('API Base URL is required for custom provider');
-        providerId = `custom:${apiUrl.replace(/\/+$/, '')}`;
+        if (!apiUrl.trim()) throw new Error(t('onboard.config.endpoint.required'));
+        if (!apiKey.trim()) throw new Error(t('onboard.config.apikey.required'));
+        if (!model.trim()) throw new Error(t('onboard.config.model.required'));
+        providerId = `custom:${apiUrl.trim().replace(/\/+$/, '')}`;
       }
 
       await onboardInit({
@@ -606,9 +593,12 @@ export default function Onboard() {
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : 'Failed to initialize configuration';
       if (/Cannot reach local API|Failed to fetch|Load failed/i.test(message)) {
-        setError(t('onboard.error.api_unreachable'));
+        const translatedMessage = t('onboard.error.api_unreachable');
+        setError(translatedMessage);
+        notify.error(translatedMessage, { key: 'onboard:submit' });
       } else {
         setError(message);
+        notify.error(message, { key: 'onboard:submit' });
       }
     } finally {
       setLoading(false);
@@ -749,18 +739,18 @@ export default function Onboard() {
               )}
 
               {/* API Key Input */}
-              {(selectedProvider.requiresApiKey || selectedTier.id === 'custom') && (
+              {providerRequiresApiKey && (
                 <div className="animate-in fade-in slide-in-from-top-2">
                   <label className="block text-sm font-medium text-gray-400 mb-2">
-                    {t('onboard.config.apikey')} {selectedTier.id === 'custom' && <span className="text-gray-500">({t('onboard.config.optional')})</span>}
+                    {t('onboard.config.apikey')}
                   </label>
                   <input
                     type="password"
                     value={apiKey}
                     onChange={(e) => setApiKey(e.target.value)}
-                    placeholder={selectedProvider.requiresApiKey ? t('onboard.config.apikey.placeholder', { provider: t(`onboard.provider.${selectedProvider.id}`) }) : t('onboard.config.apikey.optional_placeholder')}
+                    placeholder={t('onboard.config.apikey.placeholder', { provider: t(`onboard.provider.${selectedProvider.id}`) })}
                     className="w-full bg-gray-900/40 border border-gray-800/60 rounded-xl p-3.5 text-white placeholder-gray-600 focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500/50 transition-all outline-none"
-                    required={selectedProvider.requiresApiKey}
+                    required
                   />
                 </div>
               )}
@@ -1064,7 +1054,12 @@ export default function Onboard() {
                     }`}
                   >
                     <div className="relative z-10">
-                      <div className="font-semibold text-lg text-white mb-2 group-hover:text-blue-400 transition-colors">{t('onboard.features.sovereign')}</div>
+                      <div className="flex items-start justify-between gap-3 mb-2">
+                        <div className="font-semibold text-lg text-white group-hover:text-blue-400 transition-colors">{t('onboard.features.sovereign')}</div>
+                        <span className="shrink-0 text-xs px-2 py-0.5 rounded-full bg-green-500/10 text-green-400 border border-green-500/20">
+                          {t('onboard.features.sovereign.badge')}
+                        </span>
+                      </div>
                       <div className="text-sm text-gray-500 group-hover:text-gray-400 transition-colors">{t('onboard.features.sovereign.desc')}</div>
                     </div>
                   </button>
@@ -1078,13 +1073,18 @@ export default function Onboard() {
                     }`}
                   >
                      <div className="relative z-10">
-                      <div className="font-semibold text-lg text-white mb-2 group-hover:text-blue-400 transition-colors">{t('onboard.features.composio')}</div>
+                      <div className="flex items-start justify-between gap-3 mb-2">
+                        <div className="font-semibold text-lg text-white group-hover:text-blue-400 transition-colors">{t('onboard.features.composio')}</div>
+                        <span className="shrink-0 text-xs px-2 py-0.5 rounded-full bg-blue-500/10 text-blue-300 border border-blue-500/20">
+                          {t('onboard.features.composio.badge')}
+                        </span>
+                      </div>
                       <div className="text-sm text-gray-500 group-hover:text-gray-400 transition-colors">{t('onboard.features.composio.desc')}</div>
                     </div>
                   </button>
                 </div>
                 {toolMode === 'composio' && (
-                  <div className="mt-4 animate-in fade-in slide-in-from-top-2">
+                  <div className="mt-4 space-y-3 animate-in fade-in slide-in-from-top-2">
                     <input
                       type="password"
                       value={composioApiKey}
@@ -1093,6 +1093,9 @@ export default function Onboard() {
                       className="w-full bg-black/50 border border-gray-800 rounded-xl p-3.5 text-white focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500/50 transition-all outline-none"
                       required
                     />
+                    <p className="text-sm text-gray-500 leading-relaxed">
+                      {t('onboard.features.composio.note')}
+                    </p>
                   </div>
                 )}
               </div>
@@ -1102,7 +1105,6 @@ export default function Onboard() {
                 <label className="block text-sm font-medium text-gray-400 mb-3">{t('onboard.features.autonomy')}</label>
                 <div className="grid grid-cols-1 gap-3">
                   {[
-                    { id: 'read_only', label: t('onboard.features.read_only'), desc: t('onboard.features.read_only.desc') },
                     { id: 'supervised', label: t('onboard.features.supervised'), desc: t('onboard.features.supervised.desc') },
                     { id: 'full', label: t('onboard.features.full'), desc: t('onboard.features.full.desc') },
                   ].map((level) => (

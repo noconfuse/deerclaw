@@ -236,6 +236,23 @@ pub struct ModelProviderConfig {
     pub requires_openai_auth: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ModelContextWindowCacheEntry {
+    #[serde(default)]
+    pub context_window_tokens: usize,
+    #[serde(default)]
+    pub updated_at_unix: u64,
+}
+
+impl Default for ModelContextWindowCacheEntry {
+    fn default() -> Self {
+        Self {
+            context_window_tokens: 0,
+            updated_at_unix: 0,
+        }
+    }
+}
+
 // ── Delegate Agents ──────────────────────────────────────────────
 
 /// Configuration for a delegate sub-agent used by the `delegate` tool.
@@ -411,6 +428,10 @@ pub struct AgentConfig {
     /// Tool dispatch strategy (e.g. `"auto"`). Default: `"auto"`.
     #[serde(default = "default_agent_tool_dispatcher")]
     pub tool_dispatcher: String,
+    #[serde(default)]
+    pub model_context_windows: HashMap<String, ModelContextWindowCacheEntry>,
+    #[serde(default = "default_agent_model_context_window_ttl_secs")]
+    pub model_context_window_ttl_secs: u64,
 }
 
 fn default_agent_max_tool_iterations() -> usize {
@@ -425,6 +446,24 @@ fn default_agent_tool_dispatcher() -> String {
     "auto".into()
 }
 
+fn default_agent_model_context_window_ttl_secs() -> u64 {
+    7 * 24 * 60 * 60
+}
+
+fn normalize_model_context_window_cache_key(model: &str) -> Option<String> {
+    let trimmed = model.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(trimmed.to_ascii_lowercase())
+}
+
+fn model_context_window_cache_now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
+}
+
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
@@ -433,6 +472,8 @@ impl Default for AgentConfig {
             max_history_messages: default_agent_max_history_messages(),
             parallel_tools: false,
             tool_dispatcher: default_agent_tool_dispatcher(),
+            model_context_windows: HashMap::new(),
+            model_context_window_ttl_secs: default_agent_model_context_window_ttl_secs(),
         }
     }
 }
@@ -902,36 +943,18 @@ impl Default for SecretsConfig {
 
 // ── Browser (friendly-service browsing only) ───────────────────
 
-/// Computer-use sidecar configuration (`[browser.computer_use]` section).
-///
-/// Delegates OS-level mouse, keyboard, and screenshot actions to a local sidecar.
+/// Internal computer-use configuration (`[browser.computer_use]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct BrowserComputerUseConfig {
-    /// Sidecar endpoint for computer-use actions (OS-level mouse/keyboard/screenshot)
-    #[serde(default = "default_browser_computer_use_endpoint")]
-    pub endpoint: String,
-    /// Optional bearer token for computer-use sidecar
-    #[serde(default)]
-    pub api_key: Option<String>,
-    /// Per-action request timeout in milliseconds
+    /// Per-action timeout in milliseconds
     #[serde(default = "default_browser_computer_use_timeout_ms")]
     pub timeout_ms: u64,
-    /// Allow remote/public endpoint for computer-use sidecar (default: false)
-    #[serde(default)]
-    pub allow_remote_endpoint: bool,
-    /// Optional window title/process allowlist forwarded to sidecar policy
-    #[serde(default)]
-    pub window_allowlist: Vec<String>,
     /// Optional X-axis boundary for coordinate-based actions
     #[serde(default)]
     pub max_coordinate_x: Option<i64>,
     /// Optional Y-axis boundary for coordinate-based actions
     #[serde(default)]
     pub max_coordinate_y: Option<i64>,
-}
-
-fn default_browser_computer_use_endpoint() -> String {
-    "http://127.0.0.1:8787/v1/actions".into()
 }
 
 fn default_browser_computer_use_timeout_ms() -> u64 {
@@ -941,11 +964,7 @@ fn default_browser_computer_use_timeout_ms() -> u64 {
 impl Default for BrowserComputerUseConfig {
     fn default() -> Self {
         Self {
-            endpoint: default_browser_computer_use_endpoint(),
-            api_key: None,
             timeout_ms: default_browser_computer_use_timeout_ms(),
-            allow_remote_endpoint: false,
-            window_allowlist: Vec::new(),
             max_coordinate_x: None,
             max_coordinate_y: None,
         }
@@ -960,10 +979,13 @@ pub struct BrowserConfig {
     /// Enable `browser_open` tool (opens URLs in the system browser without scraping)
     #[serde(default)]
     pub enabled: bool,
+    /// Enable legacy `browser_open` tool registration when browser is enabled
+    #[serde(default = "default_true")]
+    pub open_tool_enabled: bool,
     /// Allowed domains for `browser_open` (exact or subdomain match)
     #[serde(default)]
     pub allowed_domains: Vec<String>,
-    /// Browser session name (for agent-browser automation)
+    /// Browser session name (for agent-browser automation). If unset, uses shared session `zeroclaw-main`.
     #[serde(default)]
     pub session_name: Option<String>,
     /// Browser automation backend: "agent_browser" | "rust_native" | "computer_use" | "auto"
@@ -978,7 +1000,7 @@ pub struct BrowserConfig {
     /// Optional Chrome/Chromium executable path for rust-native backend
     #[serde(default)]
     pub native_chrome_path: Option<String>,
-    /// Computer-use sidecar configuration
+    /// Internal computer-use configuration
     #[serde(default)]
     pub computer_use: BrowserComputerUseConfig,
 }
@@ -994,7 +1016,8 @@ fn default_browser_webdriver_url() -> String {
 impl Default for BrowserConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
+            open_tool_enabled: default_true(),
             allowed_domains: Vec::new(),
             session_name: None,
             backend: default_browser_backend(),
@@ -1958,17 +1981,22 @@ impl Default for BuiltinHooksConfig {
 
 /// Autonomy and security policy configuration (`[autonomy]` section).
 ///
-/// Controls what the agent is allowed to do: shell commands, filesystem access,
-/// risk approval gates, and per-policy budgets.
+/// Controls the global execution guardrails that stay stable across sessions.
+///
+/// Session-level workspace choice and execution mode are handled elsewhere; this
+/// section mainly defines shell defaults and approval overrides.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AutonomyConfig {
-    /// Autonomy level: `read_only`, `supervised` (default), or `full`.
+    /// Default autonomy level for new sessions.
     pub level: AutonomyLevel,
     /// Restrict absolute filesystem paths to workspace-relative references. Default: `true`.
     /// Resolved paths outside the workspace still require `allowed_roots`.
     pub workspace_only: bool,
     /// Allowlist of executable names permitted for shell execution.
     pub allowed_commands: Vec<String>,
+    /// Explicit denylist of executable names that are always blocked.
+    #[serde(default)]
+    pub blocked_commands: Vec<String>,
     /// Explicit path denylist. Default includes system-critical paths and sensitive dotdirs.
     pub forbidden_paths: Vec<String>,
     /// Maximum actions allowed per hour per policy. Default: `100`.
@@ -1995,7 +2023,8 @@ pub struct AutonomyConfig {
     #[serde(default = "default_auto_approve")]
     pub auto_approve: Vec<String>,
 
-    /// Tools that always require interactive approval, even after "Always".
+    /// Tools or command scopes that require approval by default in supervised mode.
+    /// A session-scoped "Always" decision suppresses repeated prompts for the same scope.
     #[serde(default = "default_always_ask")]
     pub always_ask: Vec<String>,
 
@@ -2014,11 +2043,46 @@ pub struct AutonomyConfig {
 }
 
 fn default_auto_approve() -> Vec<String> {
-    vec!["file_read".into(), "memory_recall".into()]
+    Vec::new()
+}
+
+pub(crate) fn default_shell_approval_commands() -> Vec<String> {
+    vec![
+        "rm".into(),
+        "sudo".into(),
+        "su".into(),
+        "dd".into(),
+        "mkfs".into(),
+        "shutdown".into(),
+        "reboot".into(),
+        "halt".into(),
+        "poweroff".into(),
+        "curl".into(),
+        "wget".into(),
+        "ssh".into(),
+        "scp".into(),
+        "nc".into(),
+        "ncat".into(),
+        "netcat".into(),
+        "ftp".into(),
+        "telnet".into(),
+        "mount".into(),
+        "umount".into(),
+        "iptables".into(),
+        "ufw".into(),
+        "firewall-cmd".into(),
+        "useradd".into(),
+        "userdel".into(),
+        "usermod".into(),
+        "passwd".into(),
+    ]
 }
 
 fn default_always_ask() -> Vec<String> {
-    vec![]
+    default_shell_approval_commands()
+        .into_iter()
+        .map(|command| format!("shell:{command}"))
+        .collect()
 }
 
 fn is_valid_env_var_name(name: &str) -> bool {
@@ -2050,6 +2114,24 @@ impl Default for AutonomyConfig {
                 "tail".into(),
                 "date".into(),
             ],
+            blocked_commands: vec![
+                "rm".into(),
+                "sudo".into(),
+                "su".into(),
+                "dd".into(),
+                "mkfs".into(),
+                "shutdown".into(),
+                "reboot".into(),
+                "halt".into(),
+                "poweroff".into(),
+                "curl".into(),
+                "wget".into(),
+                "ssh".into(),
+                "scp".into(),
+                "nc".into(),
+                "ncat".into(),
+                "netcat".into(),
+            ],
             forbidden_paths: vec![
                 "/etc".into(),
                 "/root".into(),
@@ -2070,7 +2152,7 @@ impl Default for AutonomyConfig {
                 "~/.aws".into(),
                 "~/.config".into(),
             ],
-            max_actions_per_hour: 20,
+            max_actions_per_hour: 100,
             max_cost_per_day_cents: 500,
             require_approval_for_medium_risk: true,
             block_high_risk_commands: true,
@@ -4083,12 +4165,6 @@ impl Config {
 
             decrypt_optional_secret(
                 &store,
-                &mut config.browser.computer_use.api_key,
-                "config.browser.computer_use.api_key",
-            )?;
-
-            decrypt_optional_secret(
-                &store,
                 &mut config.web_search.brave_api_key,
                 "config.web_search.brave_api_key",
             )?;
@@ -4231,6 +4307,49 @@ impl Config {
         }
     }
 
+    pub fn set_cached_model_context_window_tokens(
+        &mut self,
+        model: &str,
+        context_window_tokens: usize,
+    ) {
+        if context_window_tokens == 0 {
+            return;
+        }
+        let Some(key) = normalize_model_context_window_cache_key(model) else {
+            return;
+        };
+        self.agent.model_context_windows.insert(
+            key,
+            ModelContextWindowCacheEntry {
+                context_window_tokens,
+                updated_at_unix: model_context_window_cache_now_unix(),
+            },
+        );
+    }
+
+    pub fn clear_cached_model_context_window_tokens(&mut self, model: &str) {
+        let Some(key) = normalize_model_context_window_cache_key(model) else {
+            return;
+        };
+        self.agent.model_context_windows.remove(&key);
+    }
+
+    pub fn cached_model_context_window_tokens(&self, model: &str) -> Option<usize> {
+        let key = normalize_model_context_window_cache_key(model)?;
+        let entry = self.agent.model_context_windows.get(&key)?;
+        if entry.context_window_tokens == 0 {
+            return None;
+        }
+        let ttl_secs = self.agent.model_context_window_ttl_secs;
+        if ttl_secs > 0 {
+            let age = model_context_window_cache_now_unix().saturating_sub(entry.updated_at_unix);
+            if age > ttl_secs {
+                return None;
+            }
+        }
+        Some(entry.context_window_tokens)
+    }
+
     /// Validate configuration values that would cause runtime failures.
     ///
     /// Called after TOML deserialization and env-override application to catch
@@ -4296,6 +4415,20 @@ impl Config {
         }
         if self.scheduler.max_tasks == 0 {
             anyhow::bail!("scheduler.max_tasks must be greater than 0");
+        }
+
+        if self.agent.model_context_window_ttl_secs == 0 {
+            anyhow::bail!("agent.model_context_window_ttl_secs must be greater than 0");
+        }
+        for (model_key, cache_entry) in &self.agent.model_context_windows {
+            if model_key.trim().is_empty() {
+                anyhow::bail!("agent.model_context_windows contains an empty model key");
+            }
+            if cache_entry.context_window_tokens == 0 {
+                anyhow::bail!(
+                    "agent.model_context_windows.{model_key}.context_window_tokens must be greater than 0"
+                );
+            }
         }
 
         // Model routes
@@ -4366,6 +4499,18 @@ impl Config {
                         "model_providers.{profile_name}.wire_api must be one of: responses, chat_completions"
                     );
                 }
+            }
+        }
+
+        if let Some(provider) = self.default_provider.as_deref().map(str::trim) {
+            if provider.is_empty() {
+                anyhow::bail!("default_provider must not be empty");
+            }
+
+            if let Err(error) = crate::providers::create_provider(provider, None) {
+                let error_message = error.to_string();
+                let reason = error_message.lines().next().unwrap_or("invalid provider");
+                anyhow::bail!("default_provider is invalid: {reason}");
             }
         }
 
@@ -4705,12 +4850,6 @@ impl Config {
 
         encrypt_optional_secret(
             &store,
-            &mut config_to_save.browser.computer_use.api_key,
-            "config.browser.computer_use.api_key",
-        )?;
-
-        encrypt_optional_secret(
-            &store,
             &mut config_to_save.web_search.brave_api_key,
             "config.web_search.brave_api_key",
         )?;
@@ -4959,8 +5098,9 @@ mod tests {
         assert!(a.workspace_only);
         assert!(a.allowed_commands.contains(&"git".to_string()));
         assert!(a.allowed_commands.contains(&"cargo".to_string()));
+        assert!(a.blocked_commands.contains(&"rm".to_string()));
         assert!(a.forbidden_paths.contains(&"/etc".to_string()));
-        assert_eq!(a.max_actions_per_hour, 20);
+        assert_eq!(a.max_actions_per_hour, 100);
         assert_eq!(a.max_cost_per_day_cents, 500);
         assert!(a.require_approval_for_medium_risk);
         assert!(a.block_high_risk_commands);
@@ -5089,6 +5229,7 @@ default_temperature = 0.7
                 level: AutonomyLevel::Full,
                 workspace_only: false,
                 allowed_commands: vec!["docker".into()],
+                blocked_commands: vec!["rm".into()],
                 forbidden_paths: vec!["/secret".into()],
                 max_actions_per_hour: 50,
                 max_cost_per_day_cents: 1000,
@@ -5386,7 +5527,6 @@ tool_dispatcher = "xml"
         config.config_path = dir.join("config.toml");
         config.api_key = Some("root-credential".into());
         config.composio.api_key = Some("composio-credential".into());
-        config.browser.computer_use.api_key = Some("browser-credential".into());
         config.web_search.brave_api_key = Some("brave-credential".into());
         config.storage.provider.config.db_url = Some("postgres://user:pw@host/db".into());
 
@@ -5424,15 +5564,6 @@ tool_dispatcher = "xml"
         assert_eq!(
             store.decrypt(composio_encrypted).unwrap(),
             "composio-credential"
-        );
-
-        let browser_encrypted = stored.browser.computer_use.api_key.as_deref().unwrap();
-        assert!(crate::security::SecretStore::is_encrypted(
-            browser_encrypted
-        ));
-        assert_eq!(
-            store.decrypt(browser_encrypted).unwrap(),
-            "browser-credential"
         );
 
         let web_search_encrypted = stored.web_search.brave_api_key.as_deref().unwrap();
@@ -6187,23 +6318,21 @@ default_temperature = 0.7
         assert!(!c.composio.enabled);
         assert!(c.composio.api_key.is_none());
         assert!(c.secrets.encrypt);
-        assert!(!c.browser.enabled);
+        assert!(c.browser.enabled);
+        assert!(c.browser.open_tool_enabled);
         assert!(c.browser.allowed_domains.is_empty());
     }
 
     #[test]
-    async fn browser_config_default_disabled() {
+    async fn browser_config_default_enabled() {
         let b = BrowserConfig::default();
-        assert!(!b.enabled);
+        assert!(b.enabled);
         assert!(b.allowed_domains.is_empty());
         assert_eq!(b.backend, "agent_browser");
         assert!(b.native_headless);
         assert_eq!(b.native_webdriver_url, "http://127.0.0.1:9515");
         assert!(b.native_chrome_path.is_none());
-        assert_eq!(b.computer_use.endpoint, "http://127.0.0.1:8787/v1/actions");
         assert_eq!(b.computer_use.timeout_ms, 15_000);
-        assert!(!b.computer_use.allow_remote_endpoint);
-        assert!(b.computer_use.window_allowlist.is_empty());
         assert!(b.computer_use.max_coordinate_x.is_none());
         assert!(b.computer_use.max_coordinate_y.is_none());
     }
@@ -6212,6 +6341,7 @@ default_temperature = 0.7
     async fn browser_config_serde_roundtrip() {
         let b = BrowserConfig {
             enabled: true,
+            open_tool_enabled: false,
             allowed_domains: vec!["example.com".into(), "docs.example.com".into()],
             session_name: None,
             backend: "auto".into(),
@@ -6219,11 +6349,7 @@ default_temperature = 0.7
             native_webdriver_url: "http://localhost:4444".into(),
             native_chrome_path: Some("/usr/bin/chromium".into()),
             computer_use: BrowserComputerUseConfig {
-                endpoint: "https://computer-use.example.com/v1/actions".into(),
-                api_key: Some("test-token".into()),
                 timeout_ms: 8_000,
-                allow_remote_endpoint: true,
-                window_allowlist: vec!["Chrome".into(), "Visual Studio Code".into()],
                 max_coordinate_x: Some(3840),
                 max_coordinate_y: Some(2160),
             },
@@ -6231,6 +6357,7 @@ default_temperature = 0.7
         let toml_str = toml::to_string(&b).unwrap();
         let parsed: BrowserConfig = toml::from_str(&toml_str).unwrap();
         assert!(parsed.enabled);
+        assert!(!parsed.open_tool_enabled);
         assert_eq!(parsed.allowed_domains.len(), 2);
         assert_eq!(parsed.allowed_domains[0], "example.com");
         assert_eq!(parsed.backend, "auto");
@@ -6240,14 +6367,7 @@ default_temperature = 0.7
             parsed.native_chrome_path.as_deref(),
             Some("/usr/bin/chromium")
         );
-        assert_eq!(
-            parsed.computer_use.endpoint,
-            "https://computer-use.example.com/v1/actions"
-        );
-        assert_eq!(parsed.computer_use.api_key.as_deref(), Some("test-token"));
         assert_eq!(parsed.computer_use.timeout_ms, 8_000);
-        assert!(parsed.computer_use.allow_remote_endpoint);
-        assert_eq!(parsed.computer_use.window_allowlist.len(), 2);
         assert_eq!(parsed.computer_use.max_coordinate_x, Some(3840));
         assert_eq!(parsed.computer_use.max_coordinate_y, Some(2160));
     }
@@ -6260,7 +6380,7 @@ config_path = "/tmp/config.toml"
 default_temperature = 0.7
 "#;
         let parsed: Config = toml::from_str(minimal).unwrap();
-        assert!(!parsed.browser.enabled);
+        assert!(parsed.browser.enabled);
         assert!(parsed.browser.allowed_domains.is_empty());
     }
 
@@ -6622,6 +6742,72 @@ requires_openai_auth = true
         assert!(error
             .to_string()
             .contains("wire_api must be one of: responses, chat_completions"));
+    }
+
+    #[test]
+    async fn validate_rejects_custom_provider_without_url() {
+        let _env_guard = env_override_lock().await;
+        let config = Config {
+            default_provider: Some("custom".to_string()),
+            ..Config::default()
+        };
+
+        let error = config.validate().expect_err("expected validation failure");
+        assert!(error
+            .to_string()
+            .contains("default_provider is invalid: Unknown provider: custom"));
+    }
+
+    #[test]
+    async fn validate_accepts_custom_provider_with_url() {
+        let _env_guard = env_override_lock().await;
+        let config = Config {
+            default_provider: Some("custom:https://proxy.example.com/v1".to_string()),
+            ..Config::default()
+        };
+
+        let result = config.validate();
+        assert!(result.is_ok(), "expected validation to pass: {result:?}");
+    }
+
+    #[test]
+    async fn cached_model_context_window_tokens_round_trip_and_clear() {
+        let _env_guard = env_override_lock().await;
+        let mut config = Config::default();
+
+        config.set_cached_model_context_window_tokens(" GPT-4O ", 128_000);
+        assert_eq!(
+            config.cached_model_context_window_tokens("gpt-4o"),
+            Some(128_000)
+        );
+        assert_eq!(
+            config.cached_model_context_window_tokens("GPT-4O"),
+            Some(128_000)
+        );
+
+        config.clear_cached_model_context_window_tokens("gpt-4o");
+        assert_eq!(config.cached_model_context_window_tokens("gpt-4o"), None);
+    }
+
+    #[test]
+    async fn cached_model_context_window_tokens_respect_ttl() {
+        let _env_guard = env_override_lock().await;
+        let mut config = Config::default();
+        config.agent.model_context_window_ttl_secs = 1;
+        config.set_cached_model_context_window_tokens("claude-3-7-sonnet", 200_000);
+
+        if let Some(entry) = config
+            .agent
+            .model_context_windows
+            .get_mut("claude-3-7-sonnet")
+        {
+            entry.updated_at_unix = entry.updated_at_unix.saturating_sub(10);
+        }
+
+        assert_eq!(
+            config.cached_model_context_window_tokens("claude-3-7-sonnet"),
+            None
+        );
     }
 
     #[test]

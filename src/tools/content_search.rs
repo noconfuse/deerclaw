@@ -1,5 +1,5 @@
 use super::traits::{Tool, ToolResult};
-use crate::security::SecurityPolicy;
+use crate::security::{SecurityPolicy, policy::ToolOperation};
 use async_trait::async_trait;
 use serde_json::json;
 use std::process::Stdio;
@@ -95,6 +95,10 @@ impl Tool for ContentSearchTool {
             },
             "required": ["pattern"]
         })
+    }
+
+    fn operation(&self, _args: &serde_json::Value) -> ToolOperation {
+        ToolOperation::Read
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
@@ -669,12 +673,10 @@ mod tests {
     fn test_security_with(
         workspace: PathBuf,
         autonomy: AutonomyLevel,
-        max_actions_per_hour: u32,
     ) -> Arc<SecurityPolicy> {
         Arc::new(SecurityPolicy {
             autonomy,
             workspace_dir: workspace,
-            max_actions_per_hour,
             ..SecurityPolicy::default()
         })
     }

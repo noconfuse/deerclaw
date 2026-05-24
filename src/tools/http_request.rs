@@ -206,14 +206,6 @@ impl Tool for HttpRequestTool {
         let headers_val = args.get("headers").cloned().unwrap_or(json!({}));
         let body = args.get("body").and_then(|v| v.as_str());
 
-        if !self.security.can_act() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Action blocked: autonomy is read-only".into()),
-            });
-        }
-
         if !self.security.record_action() {
             return Ok(ToolResult {
                 success: false,
@@ -678,21 +670,6 @@ mod tests {
         assert!(is_private_or_local_host("100.127.255.255"));
         assert!(!is_private_or_local_host("100.63.0.1")); // Just below range
         assert!(!is_private_or_local_host("100.128.0.1")); // Just above range
-    }
-
-    #[tokio::test]
-    async fn execute_blocks_readonly_mode() {
-        let security = Arc::new(SecurityPolicy {
-            autonomy: AutonomyLevel::ReadOnly,
-            ..SecurityPolicy::default()
-        });
-        let tool = HttpRequestTool::new(security, vec!["example.com".into()], 1_000_000, 30);
-        let result = tool
-            .execute(json!({"url": "https://example.com"}))
-            .await
-            .unwrap();
-        assert!(!result.success);
-        assert!(result.error.unwrap().contains("read-only"));
     }
 
     #[tokio::test]

@@ -78,10 +78,11 @@ impl PromptSection for IdentitySection {
 
     fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
         let mut prompt = String::from("## Project Context\n\n");
+        let context_dir = shared_workspace_context_dir(ctx.workspace_dir);
         let mut has_aieos = false;
         if let Some(config) = ctx.identity_config {
             if identity::is_aieos_configured(config) {
-                if let Ok(Some(aieos)) = identity::load_aieos_identity(config, ctx.workspace_dir) {
+                if let Ok(Some(aieos)) = identity::load_aieos_identity(config, &context_dir) {
                     let rendered = identity::aieos_to_system_prompt(&aieos);
                     if !rendered.is_empty() {
                         prompt.push_str(&rendered);
@@ -107,7 +108,7 @@ impl PromptSection for IdentitySection {
             "BOOTSTRAP.md",
             "MEMORY.md",
         ] {
-            inject_workspace_file(&mut prompt, ctx.workspace_dir, file);
+            inject_workspace_file(&mut prompt, &context_dir, file);
         }
 
         Ok(prompt)
@@ -144,7 +145,7 @@ impl PromptSection for SafetySection {
     }
 
     fn build(&self, _ctx: &PromptContext<'_>) -> Result<String> {
-        Ok("## Safety\n\n- Do not exfiltrate private data.\n- Do not run destructive commands without asking.\n- Do not bypass oversight or approval mechanisms.\n- Prefer `trash` over `rm`.\n- When in doubt, ask before acting externally.".into())
+        Ok("## Safety\n\n- Do not exfiltrate private data.\n- Do not run destructive commands without asking.\n- Do not bypass oversight or approval mechanisms.\n- Prefer `trash` over `rm`.\n- Follow shell security policy constraints.\n- When in doubt, ask before acting externally.".into())
     }
 }
 
@@ -204,6 +205,15 @@ impl PromptSection for DateTimeSection {
             now.format("%Z")
         ))
     }
+}
+
+fn shared_workspace_context_dir(workspace_dir: &Path) -> std::path::PathBuf {
+    let project_dir = workspace_dir.join(crate::gateway::SESSION_WORKSPACE_PROJECT_LINK);
+    if project_dir.is_dir() {
+        return project_dir;
+    }
+
+    workspace_dir.to_path_buf()
 }
 
 fn inject_workspace_file(prompt: &mut String, workspace_dir: &Path, filename: &str) {

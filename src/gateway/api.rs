@@ -3,23 +3,37 @@
 //! All `/api/*` routes require bearer token authentication (PairingGuard).
 
 use super::{
-    clear_conversation_entries, conversation_sender_key, load_conversation_entries, AppState,
+    clear_conversation_entries, conversation_sender_key, ensure_task_session_workspace,
+    is_task_session_id, load_conversation_entries, task_session_workspace_dir, AppState,
+    SESSION_WORKSPACE_PROJECT_LINK, TASK_SESSION_PLACEHOLDER, TASK_SESSION_PREFIX,
 };
 use crate::providers::ChatMessage;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Multipart, Path, Query, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Json},
 };
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
-use std::path::Path as StdPath;
+use std::path::{Path as StdPath, PathBuf};
+use std::time::Duration;
+use uuid::Uuid;
 
 const MASKED_SECRET: &str = "***MASKED***";
+const OFFICECLI_ENV_VAR: &str = "ZEROCLAW_OFFICECLI_PATH";
+const OFFICECLI_TIMEOUT_SECS: u64 = 30;
+const WORKSPACE_PREVIEW_MAX_CHARS: usize = 120_000;
+const HIDDEN_SESSION_WORKSPACE_ROOTS: &[&str] =
+    &["state", "cron", "skills", SESSION_WORKSPACE_PROJECT_LINK];
+const WORKSPACE_PREVIEW_HTML_MAX_CHARS: usize = 500_000;
+const OFFICE_SAFE_ENV_VARS: &[&str] = &[
+    "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER", "SHELL", "TMPDIR",
+];
 
 // ── Bearer token auth extractor ─────────────────────────────────
 
@@ -71,13 +85,90 @@ pub struct ChatHistoryQuery {
 #[derive(Serialize)]
 pub struct ChatSessionItem {
     pub session_id: String,
-    pub channel: String,
-    pub sender: String,
+    pub kind: String,
+    pub title: String,
+    pub channel: Option<String>,
+    pub sender: Option<String>,
     pub thread_ts: Option<String>,
     pub last_role: String,
     pub last_message: String,
     pub last_timestamp: String,
     pub message_count: usize,
+}
+
+#[derive(Serialize)]
+pub struct ChatSessionCreateResponse {
+    pub session_id: String,
+}
+
+#[derive(Deserialize)]
+pub struct ChatAttachmentUploadQuery {
+    pub session: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct ChatAttachmentUploadItem {
+    pub name: String,
+    pub mime_type: String,
+    pub size: usize,
+    pub local_path: String,
+}
+
+#[derive(Serialize)]
+pub struct ChatAttachmentUploadResponse {
+    pub files: Vec<ChatAttachmentUploadItem>,
+}
+
+#[derive(Deserialize)]
+pub struct ChatWorkspaceQuery {
+    pub session: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct ChatWorkspaceFileItem {
+    pub name: String,
+    pub mime_type: String,
+    pub size: usize,
+    pub workspace_path: String,
+    pub local_path: String,
+    pub relative_path: String,
+    pub kind: String,
+    pub text_preview: Option<String>,
+    pub image_data_url: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct ChatWorkspaceResponse {
+    pub scope_path: String,
+    pub files: Vec<ChatWorkspaceFileItem>,
+}
+
+#[derive(Deserialize)]
+pub struct ChatWorkspacePreviewQuery {
+    pub session: Option<String>,
+    pub path: String,
+}
+
+#[derive(Deserialize)]
+pub struct ChatWorkspaceOpenFolderBody {
+    pub session: Option<String>,
+    pub path: String,
+}
+
+#[derive(Serialize)]
+pub struct ChatWorkspacePreviewResponse {
+    pub name: String,
+    pub mime_type: String,
+    pub size: usize,
+    pub workspace_path: String,
+    pub local_path: String,
+    pub relative_path: String,
+    pub kind: String,
+    pub html_preview: Option<String>,
+    pub text_preview: Option<String>,
+    pub outline_preview: Option<String>,
+    pub image_data_url: Option<String>,
+    pub preview_source: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -132,8 +223,8 @@ pub async fn handle_api_status(
 
     let body = serde_json::json!({
         "provider": config.default_provider,
-        "model": state.model,
-        "temperature": state.temperature,
+        "model": config.default_model,
+        "temperature": config.default_temperature,
         "uptime_seconds": health.uptime_seconds,
         "gateway_port": config.gateway.port,
         "locale": "en",
@@ -141,6 +232,7 @@ pub async fn handle_api_status(
         "paired": state.pairing.is_paired(),
         "channels": channels,
         "health": health,
+        "vision_supported": state.provider.supports_vision(),
     });
 
     Json(body).into_response()
@@ -215,6 +307,7 @@ pub async fn handle_api_chat_history_get(
     let has_more = items.len() > limit;
     let messages = items
         .into_iter()
+        .filter(|(_, msg)| msg.role != "system")
         .take(limit)
         .map(|(timestamp, msg)| {
             serde_json::json!({
@@ -250,7 +343,824 @@ fn parse_channel_session_id(session_id: &str) -> Option<(String, String, Option<
     Some((channel, sender, thread_ts))
 }
 
-/// GET /api/chat/sessions — list channel conversation sessions
+fn build_task_session_id() -> String {
+    format!("{TASK_SESSION_PREFIX}{}", Uuid::new_v4())
+}
+
+fn task_session_title(last_message: &str) -> String {
+    let trimmed = last_message.trim();
+    if trimmed.is_empty() {
+        "Untitled Task".to_string()
+    } else {
+        trimmed.chars().take(48).collect()
+    }
+}
+
+fn is_internal_history_role(role: &str) -> bool {
+    matches!(role, "system" | "reasoning" | "tool")
+}
+
+fn sanitize_attachment_filename(filename: &str) -> String {
+    let candidate = StdPath::new(filename)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("attachment.bin");
+    let sanitized = candidate
+        .chars()
+        .map(|ch| match ch {
+            '/' | '\\' | ':' | '\0' => '_',
+            _ if ch.is_control() => '_',
+            _ => ch,
+        })
+        .collect::<String>();
+    let trimmed = sanitized.trim().trim_matches('.');
+    if trimmed.is_empty() {
+        "attachment.bin".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn sanitize_attachment_directory_name(value: &str) -> String {
+    let sanitized = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let trimmed = sanitized.trim_matches('_');
+    if trimmed.is_empty() {
+        "session".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn attachment_storage_dir(session_id: Option<&str>) -> PathBuf {
+    let session_component = session_id
+        .map(sanitize_attachment_directory_name)
+        .unwrap_or_else(|| "default".to_string());
+    directories::ProjectDirs::from("com", "zeroclaw", "zeroclaw")
+        .map(|dirs| dirs.cache_dir().to_path_buf())
+        .unwrap_or_else(std::env::temp_dir)
+        .join("zeroclaw-chat")
+        .join("attachments")
+        .join(session_component)
+}
+
+fn chat_workspace_dir(workspace_dir: &StdPath, session_id: Option<&str>) -> Result<PathBuf> {
+    match session_id.filter(|value| is_task_session_id(value)) {
+        Some(task_session_id) => ensure_task_session_workspace(workspace_dir, task_session_id),
+        None => Ok(workspace_dir.to_path_buf()),
+    }
+}
+
+fn chat_workspace_scope_path(workspace_dir: &StdPath, session_id: Option<&str>) -> Result<String> {
+    let scope_dir = match session_id.filter(|value| is_task_session_id(value)) {
+        Some(task_session_id) => task_session_workspace_dir(workspace_dir, task_session_id),
+        None => workspace_dir.to_path_buf(),
+    };
+    Ok(scope_dir
+        .strip_prefix(workspace_dir)
+        .unwrap_or(&scope_dir)
+        .to_string_lossy()
+        .into_owned())
+}
+
+fn attachment_display_name(stored_name: &str) -> String {
+    let Some((prefix, remainder)) = stored_name.split_once('-') else {
+        return stored_name.to_string();
+    };
+    if prefix.len() == 32
+        && prefix.chars().all(|ch| ch.is_ascii_hexdigit())
+        && !remainder.is_empty()
+    {
+        remainder.to_string()
+    } else {
+        stored_name.to_string()
+    }
+}
+
+fn attachment_kind_for_mime(mime_type: &str) -> &'static str {
+    if mime_type.starts_with("image/") {
+        "image"
+    } else if mime_type.starts_with("text/") {
+        "text"
+    } else {
+        "file"
+    }
+}
+
+fn attachment_text_preview(bytes: &[u8], mime_type: &str, file_name: &str) -> Option<String> {
+    let lower_name = file_name.to_ascii_lowercase();
+    let is_text_like = mime_type.starts_with("text/")
+        || matches!(
+            lower_name.rsplit('.').next(),
+            Some(
+                "md" | "txt"
+                    | "json"
+                    | "yaml"
+                    | "yml"
+                    | "toml"
+                    | "csv"
+                    | "log"
+                    | "xml"
+                    | "html"
+                    | "css"
+                    | "js"
+                    | "ts"
+                    | "tsx"
+                    | "jsx"
+                    | "rs"
+                    | "py"
+                    | "sh"
+                    | "sql"
+            )
+        );
+    if !is_text_like {
+        return None;
+    }
+    let preview = String::from_utf8_lossy(bytes)
+        .replace('\0', "")
+        .trim()
+        .chars()
+        .take(4000)
+        .collect::<String>();
+    if preview.is_empty() {
+        None
+    } else {
+        Some(preview)
+    }
+}
+
+fn attachment_image_preview_data_url(bytes: &[u8], mime_type: &str) -> Option<String> {
+    if !mime_type.starts_with("image/") || bytes.len() > 512 * 1024 {
+        return None;
+    }
+    Some(format!(
+        "data:{mime_type};base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    ))
+}
+
+fn relative_workspace_path(base_dir: &StdPath, path: &StdPath) -> Option<String> {
+    path.strip_prefix(base_dir)
+        .ok()
+        .map(|relative| relative.to_string_lossy().into_owned())
+}
+
+fn workspace_item_display_path(scope_path: &str, relative_path: &str) -> String {
+    PathBuf::from(scope_path)
+        .join(relative_path)
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn workspace_item_mime_type(path: &StdPath, is_dir: bool) -> String {
+    if is_dir {
+        "inode/directory".to_string()
+    } else {
+        mime_guess::from_path(path)
+            .first_or_octet_stream()
+            .essence_str()
+            .to_string()
+    }
+}
+
+fn should_use_office_preview(path: &StdPath) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase())
+        .is_some_and(|ext| matches!(ext.as_str(), "docx" | "pptx" | "xlsx"))
+}
+
+fn resolve_officecli_path() -> Option<PathBuf> {
+    let configured = std::env::var(OFFICECLI_ENV_VAR).ok()?;
+    let trimmed = configured.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let candidate = PathBuf::from(trimmed);
+    candidate.is_file().then_some(candidate)
+}
+
+async fn run_officecli_preview(
+    path: &StdPath,
+    mode: &str,
+    max_chars: Option<usize>,
+) -> Result<String> {
+    let officecli_path = resolve_officecli_path()
+        .ok_or_else(|| anyhow::anyhow!("Bundled OfficeCLI path is unavailable"))?;
+
+    let mut command = tokio::process::Command::new(officecli_path);
+    command.arg("view").arg(path).arg(mode);
+    command.env_clear();
+    command.stdin(std::process::Stdio::null());
+    for var in OFFICE_SAFE_ENV_VARS {
+        if let Ok(value) = std::env::var(var) {
+            command.env(var, value);
+        }
+    }
+
+    let output = tokio::time::timeout(
+        Duration::from_secs(OFFICECLI_TIMEOUT_SECS),
+        command.output(),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("OfficeCLI timed out after {OFFICECLI_TIMEOUT_SECS}s"))??;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if !output.status.success() {
+        anyhow::bail!(
+            "{}",
+            if stderr.is_empty() {
+                format!("OfficeCLI exited with status {}", output.status)
+            } else {
+                format!("OfficeCLI failed: {stderr}")
+            }
+        );
+    }
+
+    let rendered = if stdout.is_empty() {
+        "OfficeCLI returned no readable output".to_string()
+    } else {
+        stdout
+    };
+    Ok(match max_chars {
+        Some(max_chars) => rendered.chars().take(max_chars).collect(),
+        None => rendered,
+    })
+}
+
+async fn open_folder_in_system(path: &StdPath) -> Result<()> {
+    let mut command = if cfg!(target_os = "macos") {
+        let mut command = tokio::process::Command::new("open");
+        command.arg(path);
+        command
+    } else if cfg!(target_os = "windows") {
+        let mut command = tokio::process::Command::new("explorer");
+        command.arg(path);
+        command
+    } else {
+        let mut command = tokio::process::Command::new("xdg-open");
+        command.arg(path);
+        command
+    };
+
+    command.stdin(std::process::Stdio::null());
+    command.stdout(std::process::Stdio::null());
+    command.stderr(std::process::Stdio::null());
+
+    let status = command
+        .status()
+        .await
+        .with_context(|| format!("Failed to spawn folder opener for {}", path.display()))?;
+
+    if !status.success() {
+        anyhow::bail!("Folder opener exited with status {status}");
+    }
+
+    Ok(())
+}
+
+fn collect_workspace_files(
+    scope_dir: &StdPath,
+    current_dir: &StdPath,
+    scope_path: &str,
+    hide_internal_entries: bool,
+    files: &mut Vec<ChatWorkspaceFileItem>,
+) -> Result<()> {
+    let mut entries = fs::read_dir(current_dir)?.flatten().collect::<Vec<_>>();
+    entries.sort_by_key(|entry| entry.file_name().to_string_lossy().to_ascii_lowercase());
+
+    for entry in entries {
+        let path = entry.path();
+        let metadata = match entry.metadata() {
+            Ok(metadata) if metadata.is_file() || metadata.is_dir() => metadata,
+            _ => continue,
+        };
+
+        let is_dir = metadata.is_dir();
+        let stored_name = entry.file_name().to_string_lossy().into_owned();
+        let display_name = attachment_display_name(&stored_name);
+        let relative_path = match relative_workspace_path(scope_dir, &path) {
+            Some(relative_path) => relative_path,
+            None => continue,
+        };
+        if hide_internal_entries && should_hide_session_workspace_path(&relative_path) {
+            continue;
+        }
+        let mime_type = workspace_item_mime_type(&path, is_dir);
+        let bytes = if is_dir {
+            Vec::new()
+        } else {
+            fs::read(&path).unwrap_or_default()
+        };
+
+        files.push(ChatWorkspaceFileItem {
+            name: display_name,
+            mime_type: mime_type.clone(),
+            size: if is_dir { 0 } else { metadata.len() as usize },
+            workspace_path: workspace_item_display_path(scope_path, &relative_path),
+            local_path: path.to_string_lossy().into_owned(),
+            relative_path: relative_path.clone(),
+            kind: if is_dir {
+                "directory".to_string()
+            } else {
+                attachment_kind_for_mime(&mime_type).to_string()
+            },
+            text_preview: if is_dir {
+                None
+            } else {
+                attachment_text_preview(&bytes, &mime_type, &stored_name)
+            },
+            image_data_url: if is_dir {
+                None
+            } else {
+                attachment_image_preview_data_url(&bytes, &mime_type)
+            },
+        });
+
+        if is_dir {
+            collect_workspace_files(scope_dir, &path, scope_path, hide_internal_entries, files)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn should_hide_session_workspace_path(relative_path: &str) -> bool {
+    let Some(root) = relative_path
+        .split('/')
+        .next()
+        .filter(|segment| !segment.is_empty())
+    else {
+        return false;
+    };
+
+    HIDDEN_SESSION_WORKSPACE_ROOTS.contains(&root)
+}
+
+fn resolve_workspace_preview_path(
+    workspace_dir: &StdPath,
+    session_id: Option<&str>,
+    requested_relative_path: &str,
+) -> Result<(PathBuf, String)> {
+    let scope_dir = chat_workspace_dir(workspace_dir, session_id)?;
+    let scope_dir = fs::canonicalize(&scope_dir).unwrap_or(scope_dir);
+    let requested_path = PathBuf::from(requested_relative_path);
+    if requested_path.is_absolute()
+        || requested_path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        anyhow::bail!("Invalid workspace path");
+    }
+
+    let full_path = scope_dir.join(&requested_path);
+    let resolved = fs::canonicalize(&full_path)
+        .map_err(|err| anyhow::anyhow!("Failed to resolve workspace file: {err}"))?;
+    if !resolved.starts_with(&scope_dir) {
+        anyhow::bail!("Workspace file path escapes the session scope");
+    }
+
+    Ok((resolved, requested_path.to_string_lossy().into_owned()))
+}
+
+/// POST /api/chat/sessions — create an empty desktop task session
+pub async fn handle_api_chat_session_create(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let session_id = build_task_session_id();
+    let placeholder = ChatMessage::system(TASK_SESSION_PLACEHOLDER);
+    if let Err(err) =
+        super::store_conversation_turn(state.mem.clone(), &session_id, &placeholder).await
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": format!("Failed to create task session: {err}")
+            })),
+        )
+            .into_response();
+    }
+
+    Json(ChatSessionCreateResponse { session_id }).into_response()
+}
+
+/// POST /api/chat/attachments — store selected files in a session-scoped temp attachment directory
+pub async fn handle_api_chat_attachments_upload(
+    State(state): State<AppState>,
+    Query(params): Query<ChatAttachmentUploadQuery>,
+    headers: HeaderMap,
+    mut multipart: Multipart,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    if let Some(session_id) = params.session.as_deref() {
+        if parse_channel_session_id(session_id).is_none() && !is_task_session_id(session_id) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "Invalid chat session"
+                })),
+            )
+                .into_response();
+        }
+    }
+
+    let target_dir = attachment_storage_dir(params.session.as_deref());
+    if let Err(err) = fs::create_dir_all(&target_dir) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": format!("Failed to prepare attachment directory: {err}")
+            })),
+        )
+            .into_response();
+    }
+
+    let mut uploaded = Vec::new();
+    loop {
+        let field = match multipart.next_field().await {
+            Ok(Some(field)) => field,
+            Ok(None) => break,
+            Err(err) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": format!("Invalid multipart upload: {err}")
+                    })),
+                )
+                    .into_response();
+            }
+        };
+
+        let field_name = field.name().map(ToString::to_string);
+        let has_filename = field.file_name().is_some();
+        if !has_filename && field_name.as_deref() != Some("files") {
+            continue;
+        }
+
+        let original_name = field
+            .file_name()
+            .map(sanitize_attachment_filename)
+            .unwrap_or_else(|| "attachment.bin".to_string());
+        let mime_type = field
+            .content_type()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "application/octet-stream".to_string());
+        let bytes = match field.bytes().await {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": format!("Failed to read upload field: {err}")
+                    })),
+                )
+                    .into_response();
+            }
+        };
+        let stored_name = format!("{}-{}", Uuid::new_v4().simple(), original_name);
+        let stored_path = target_dir.join(&stored_name);
+        if let Err(err) = fs::write(&stored_path, &bytes) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": format!("Failed to write attachment: {err}")
+                })),
+            )
+                .into_response();
+        }
+
+        uploaded.push(ChatAttachmentUploadItem {
+            name: original_name,
+            mime_type,
+            size: bytes.len(),
+            local_path: stored_path.to_string_lossy().into_owned(),
+        });
+    }
+
+    if uploaded.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "No files were uploaded"
+            })),
+        )
+            .into_response();
+    }
+
+    Json(ChatAttachmentUploadResponse { files: uploaded }).into_response()
+}
+
+/// GET /api/chat/workspace — inspect the current session-bound attachment workspace
+pub async fn handle_api_chat_workspace(
+    State(state): State<AppState>,
+    Query(params): Query<ChatWorkspaceQuery>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    if let Some(session_id) = params.session.as_deref() {
+        if parse_channel_session_id(session_id).is_none() && !is_task_session_id(session_id) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "Invalid chat session"
+                })),
+            )
+                .into_response();
+        }
+    }
+
+    let workspace_dir = state.config.lock().workspace_dir.clone();
+    let target_dir = match chat_workspace_dir(&workspace_dir, params.session.as_deref()) {
+        Ok(target_dir) => target_dir,
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": format!("Failed to prepare session workspace: {err}")
+                })),
+            )
+                .into_response();
+        }
+    };
+    let scope_path = match chat_workspace_scope_path(&workspace_dir, params.session.as_deref()) {
+        Ok(scope_path) => scope_path,
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": format!("Failed to resolve workspace scope: {err}")
+                })),
+            )
+                .into_response();
+        }
+    };
+    let mut files = Vec::new();
+    let hide_internal_entries = params
+        .session
+        .as_deref()
+        .is_some_and(|session_id| is_task_session_id(session_id));
+
+    if target_dir.exists() {
+        if let Err(err) = collect_workspace_files(
+            &target_dir,
+            &target_dir,
+            &scope_path,
+            hide_internal_entries,
+            &mut files,
+        ) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": format!("Failed to read workspace directory: {err}")
+                })),
+            )
+                .into_response();
+        }
+    }
+
+    Json(ChatWorkspaceResponse { scope_path, files }).into_response()
+}
+
+/// GET /api/chat/workspace/preview — load an on-demand preview for a workspace file
+pub async fn handle_api_chat_workspace_preview(
+    State(state): State<AppState>,
+    Query(params): Query<ChatWorkspacePreviewQuery>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    if let Some(session_id) = params.session.as_deref() {
+        if parse_channel_session_id(session_id).is_none() && !is_task_session_id(session_id) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "Invalid chat session"
+                })),
+            )
+                .into_response();
+        }
+    }
+
+    let workspace_dir = state.config.lock().workspace_dir.clone();
+    let scope_path = match chat_workspace_scope_path(&workspace_dir, params.session.as_deref()) {
+        Ok(scope_path) => scope_path,
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": format!("Failed to resolve workspace scope: {err}")
+                })),
+            )
+                .into_response();
+        }
+    };
+    let (resolved_path, relative_path) = match resolve_workspace_preview_path(
+        &workspace_dir,
+        params.session.as_deref(),
+        &params.path,
+    ) {
+        Ok(values) => values,
+        Err(err) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": err.to_string()
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let metadata = match fs::metadata(&resolved_path) {
+        Ok(metadata) => metadata,
+        Err(err) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": format!("Failed to read workspace file metadata: {err}")
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let is_dir = metadata.is_dir();
+    let stored_name = resolved_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_string();
+    let display_name = attachment_display_name(&stored_name);
+    let mime_type = workspace_item_mime_type(&resolved_path, is_dir);
+    let bytes = if is_dir {
+        Vec::new()
+    } else {
+        match fs::read(&resolved_path) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": format!("Failed to read workspace file: {err}")
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    };
+
+    let mut html_preview = None;
+    let mut text_preview = None;
+    let mut outline_preview = None;
+    let mut image_data_url = None;
+    let preview_source = if is_dir {
+        Some("directory".to_string())
+    } else if mime_type.starts_with("image/") {
+        image_data_url = attachment_image_preview_data_url(&bytes, &mime_type);
+        Some("image".to_string())
+    } else if should_use_office_preview(&resolved_path) {
+        match run_officecli_preview(&resolved_path, "text", Some(WORKSPACE_PREVIEW_MAX_CHARS)).await
+        {
+            Ok(text) => {
+                text_preview = Some(text);
+                outline_preview = run_officecli_preview(
+                    &resolved_path,
+                    "outline",
+                    Some(WORKSPACE_PREVIEW_MAX_CHARS / 2),
+                )
+                .await
+                .ok();
+                html_preview = run_officecli_preview(&resolved_path, "html", None)
+                    .await
+                    .ok()
+                    .filter(|html| html.chars().count() <= WORKSPACE_PREVIEW_HTML_MAX_CHARS);
+                Some("officecli".to_string())
+            }
+            Err(err) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": format!("Failed to preview Office file: {err}")
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        text_preview = attachment_text_preview(&bytes, &mime_type, &stored_name);
+        text_preview.as_ref().map(|_| "text".to_string())
+    };
+
+    Json(ChatWorkspacePreviewResponse {
+        name: display_name,
+        mime_type,
+        size: if is_dir { 0 } else { metadata.len() as usize },
+        workspace_path: workspace_item_display_path(&scope_path, &relative_path),
+        local_path: resolved_path.to_string_lossy().into_owned(),
+        relative_path,
+        kind: if is_dir {
+            "directory".to_string()
+        } else {
+            attachment_kind_for_mime(&workspace_item_mime_type(&resolved_path, false)).to_string()
+        },
+        html_preview,
+        text_preview,
+        outline_preview,
+        image_data_url,
+        preview_source,
+    })
+    .into_response()
+}
+
+/// POST /api/chat/workspace/open-folder — open a workspace file's parent folder in the OS file manager
+pub async fn handle_api_chat_workspace_open_folder(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<ChatWorkspaceOpenFolderBody>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    if let Some(session_id) = body.session.as_deref() {
+        if parse_channel_session_id(session_id).is_none() && !is_task_session_id(session_id) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "Invalid chat session"
+                })),
+            )
+                .into_response();
+        }
+    }
+
+    let workspace_dir = state.config.lock().workspace_dir.clone();
+    let (resolved_path, _) =
+        match resolve_workspace_preview_path(&workspace_dir, body.session.as_deref(), &body.path) {
+            Ok(values) => values,
+            Err(err) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": err.to_string()
+                    })),
+                )
+                    .into_response();
+            }
+        };
+
+    let target_dir = if resolved_path.is_dir() {
+        resolved_path
+    } else {
+        match resolved_path.parent() {
+            Some(parent) => parent.to_path_buf(),
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "Unable to resolve parent directory"
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    };
+
+    match open_folder_in_system(&target_dir).await {
+        Ok(()) => Json(serde_json::json!({ "status": "ok" })).into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": format!("Failed to open folder: {err}")
+            })),
+        )
+            .into_response(),
+    }
+}
+
+/// GET /api/chat/sessions — list task and channel conversation sessions
 pub async fn handle_api_chat_sessions(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -276,6 +1186,8 @@ pub async fn handle_api_chat_sessions(
 
     #[derive(Default)]
     struct SessionAgg {
+        kind: String,
+        title: String,
         channel: String,
         sender: String,
         thread_ts: Option<String>,
@@ -283,6 +1195,7 @@ pub async fn handle_api_chat_sessions(
         last_message: String,
         last_timestamp: String,
         message_count: usize,
+        has_visible_message: bool,
     }
 
     let mut sessions: HashMap<String, SessionAgg> = HashMap::new();
@@ -290,17 +1203,42 @@ pub async fn handle_api_chat_sessions(
         let Some(session_id) = entry.session_id.as_deref() else {
             continue;
         };
-        let Some((channel, sender, thread_ts)) = parse_channel_session_id(session_id) else {
-            continue;
-        };
-        let (last_role, last_message) = match serde_json::from_str::<ChatMessage>(&entry.content) {
-            Ok(msg) => (msg.role, msg.content),
-            Err(_) => ("unknown".to_string(), entry.content.clone()),
+        let parsed_kind =
+            if let Some((channel, sender, thread_ts)) = parse_channel_session_id(session_id) {
+                (
+                    "channel".to_string(),
+                    "Channel Session".to_string(),
+                    channel,
+                    sender,
+                    thread_ts,
+                )
+            } else if is_task_session_id(session_id) {
+                (
+                    "task".to_string(),
+                    "Untitled Task".to_string(),
+                    String::new(),
+                    String::new(),
+                    None,
+                )
+            } else {
+                continue;
+            };
+        let (kind, fallback_title, channel, sender, thread_ts) = parsed_kind;
+        let parsed_message = serde_json::from_str::<ChatMessage>(&entry.content).ok();
+        let (last_role, last_message, visible_message) = match parsed_message {
+            Some(msg) if msg.role == "system" && msg.content == TASK_SESSION_PLACEHOLDER => {
+                ("system".to_string(), String::new(), false)
+            }
+            Some(msg) if is_internal_history_role(&msg.role) => (msg.role, msg.content, false),
+            Some(msg) => (msg.role, msg.content, true),
+            None => ("unknown".to_string(), entry.content.clone(), true),
         };
 
         let session_key = session_id.to_string();
         let agg = match sessions.entry(session_key) {
             Entry::Vacant(slot) => slot.insert(SessionAgg {
+                kind,
+                title: fallback_title,
                 channel,
                 sender,
                 thread_ts,
@@ -308,15 +1246,25 @@ pub async fn handle_api_chat_sessions(
                 last_message: last_message.clone(),
                 last_timestamp: entry.timestamp.clone(),
                 message_count: 0,
+                has_visible_message: false,
             }),
             Entry::Occupied(slot) => slot.into_mut(),
         };
 
-        agg.message_count += 1;
-        if entry.timestamp >= agg.last_timestamp {
+        if visible_message {
+            agg.message_count += 1;
+            agg.has_visible_message = true;
+        }
+        if visible_message && entry.timestamp >= agg.last_timestamp {
             agg.last_timestamp = entry.timestamp.clone();
             agg.last_role = last_role;
             agg.last_message = last_message;
+            if agg.kind == "task" {
+                agg.title = task_session_title(&agg.last_message);
+            }
+        }
+        if !agg.has_visible_message && agg.kind == "task" {
+            agg.title = "Untitled Task".to_string();
         }
     }
 
@@ -324,8 +1272,18 @@ pub async fn handle_api_chat_sessions(
         .into_iter()
         .map(|(session_id, agg)| ChatSessionItem {
             session_id,
-            channel: agg.channel,
-            sender: agg.sender,
+            kind: agg.kind,
+            title: agg.title,
+            channel: if agg.channel.is_empty() {
+                None
+            } else {
+                Some(agg.channel)
+            },
+            sender: if agg.sender.is_empty() {
+                None
+            } else {
+                Some(agg.sender)
+            },
             thread_ts: agg.thread_ts,
             last_role: agg.last_role,
             last_message: agg.last_message,
@@ -339,20 +1297,30 @@ pub async fn handle_api_chat_sessions(
     Json(serde_json::json!({ "sessions": items })).into_response()
 }
 
-/// DELETE /api/chat/history — clear conversation history for current session
-pub async fn handle_api_chat_history_delete(
+/// DELETE /api/chat/sessions/:session_id — delete a task or channel conversation session
+pub async fn handle_api_chat_session_delete(
     State(state): State<AppState>,
+    Path(session_id): Path<String>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
 
-    let token = extract_bearer_token(&headers);
-    let sender_key = conversation_sender_key(token);
-    let deleted = clear_conversation_entries(state.mem.clone(), &sender_key)
+    if parse_channel_session_id(&session_id).is_none() && !is_task_session_id(&session_id) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "Only task and channel sessions can be deleted"
+            })),
+        )
+            .into_response();
+    }
+
+    let deleted = clear_conversation_entries(state.mem.clone(), &session_id)
         .await
         .unwrap_or(0);
+    state.conversation_histories.lock().remove(&session_id);
 
     Json(serde_json::json!({
         "deleted": deleted,
@@ -452,13 +1420,19 @@ pub async fn handle_api_tools(
     }
 
     let tools: Vec<serde_json::Value> = state
-        .tools_registry
+        .tools_registry_runtime
         .iter()
-        .map(|spec| {
+        .map(|tool| {
+            let spec = tool.spec();
+            let operation = match tool.operation(&serde_json::json!({})) {
+                crate::security::policy::ToolOperation::Read => "read",
+                crate::security::policy::ToolOperation::Act => "act",
+            };
             serde_json::json!({
                 "name": spec.name,
                 "description": spec.description,
                 "parameters": spec.parameters,
+                "operation": operation,
             })
         })
         .collect();
@@ -1178,7 +2152,6 @@ fn mask_sensitive_fields(config: &crate::config::Config) -> crate::config::Confi
     mask_vec_secrets(&mut masked.reliability.api_keys);
     mask_vec_secrets(&mut masked.gateway.paired_tokens);
     mask_optional_secret(&mut masked.composio.api_key);
-    mask_optional_secret(&mut masked.browser.computer_use.api_key);
     mask_optional_secret(&mut masked.web_search.brave_api_key);
     mask_optional_secret(&mut masked.storage.provider.config.db_url);
     mask_optional_secret(&mut masked.memory.qdrant.api_key);
@@ -1282,10 +2255,6 @@ fn restore_masked_sensitive_fields(
         &current.reliability.api_keys,
     );
     restore_optional_secret(&mut incoming.composio.api_key, &current.composio.api_key);
-    restore_optional_secret(
-        &mut incoming.browser.computer_use.api_key,
-        &current.browser.computer_use.api_key,
-    );
     restore_optional_secret(
         &mut incoming.web_search.brave_api_key,
         &current.web_search.brave_api_key,
@@ -1593,7 +2562,6 @@ pub async fn handle_api_onboard_init(
     // Autonomy
     if let Some(level) = body.autonomy_level {
         match level.as_str() {
-            "read_only" => config.autonomy.level = crate::security::AutonomyLevel::ReadOnly,
             "supervised" => config.autonomy.level = crate::security::AutonomyLevel::Supervised,
             "full" => config.autonomy.level = crate::security::AutonomyLevel::Full,
             _ => {}
@@ -1926,6 +2894,22 @@ fn write_if_missing(path: &StdPath, content: &str) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_workspace_listing_hides_internal_roots() {
+        assert!(should_hide_session_workspace_path("project"));
+        assert!(should_hide_session_workspace_path("project/src/main.rs"));
+        assert!(should_hide_session_workspace_path("state"));
+        assert!(should_hide_session_workspace_path("state/runtime.json"));
+        assert!(should_hide_session_workspace_path("cron/jobs.db"));
+        assert!(should_hide_session_workspace_path(
+            "skills/example/SKILL.md"
+        ));
+        assert!(!should_hide_session_workspace_path("report.md"));
+        assert!(!should_hide_session_workspace_path(
+            "artifacts/output/index.html"
+        ));
+    }
 
     #[test]
     fn masking_keeps_toml_valid_and_preserves_api_keys_type() {

@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use crate::security::policy::ToolOperation;
 
 /// Result of a tool execution
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -28,6 +29,11 @@ pub trait Tool: Send + Sync {
 
     /// JSON schema for parameters
     fn parameters_schema(&self) -> serde_json::Value;
+
+    /// Whether this tool invocation is read-only or causes side effects.
+    fn operation(&self, _args: &serde_json::Value) -> ToolOperation {
+        ToolOperation::Act
+    }
 
     /// Execute the tool with given arguments
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult>;

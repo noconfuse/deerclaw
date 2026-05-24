@@ -241,7 +241,7 @@
   <text x="695" y="669" text-anchor="middle" fill="#ef4444" font-size="9">Null byte + Symlink escape block</text>
   <text x="695" y="686" text-anchor="middle" fill="#ef4444" font-size="9">System dirs + Dotfiles blocked</text>
   <text x="695" y="706" text-anchor="middle" fill="#ef4444" font-size="9">Default: Supervised + workspace-only</text>
-  <text x="695" y="726" text-anchor="middle" fill="#ef4444" font-size="9">Levels: ReadOnly / Supervised / Full</text>
+  <text x="695" y="726" text-anchor="middle" fill="#ef4444" font-size="9">Levels: Supervised / Full</text>
 
   <!-- Arrow: Agent → Sandbox -->
   <line x1="695" y1="550" x2="695" y2="570" stroke="#ef4444" stroke-width="2"/>

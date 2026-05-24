@@ -1330,7 +1330,7 @@ pub struct ComposioAction {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::security::{AutonomyLevel, SecurityPolicy};
+    use crate::security::SecurityPolicy;
 
     fn test_security() -> Arc<SecurityPolicy> {
         Arc::new(SecurityPolicy::default())
@@ -1414,28 +1414,6 @@ mod tests {
         let tool = ComposioTool::new("test-key", None, test_security());
         let result = tool.execute(json!({"action": "connect"})).await;
         assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn execute_blocked_in_readonly_mode() {
-        let readonly = Arc::new(SecurityPolicy {
-            autonomy: AutonomyLevel::ReadOnly,
-            ..SecurityPolicy::default()
-        });
-        let tool = ComposioTool::new("test-key", None, readonly);
-        let result = tool
-            .execute(json!({
-                "action": "execute",
-                "action_name": "GITHUB_LIST_REPOS"
-            }))
-            .await
-            .unwrap();
-        assert!(!result.success);
-        assert!(result
-            .error
-            .as_deref()
-            .unwrap_or("")
-            .contains("read-only mode"));
     }
 
     #[tokio::test]

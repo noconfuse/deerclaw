@@ -1,5 +1,6 @@
 use super::traits::{Tool, ToolResult};
 use crate::memory::Memory;
+use crate::security::policy::ToolOperation;
 use async_trait::async_trait;
 use serde_json::json;
 use std::fmt::Write;
@@ -41,6 +42,10 @@ impl Tool for MemoryRecallTool {
             },
             "required": ["query"]
         })
+    }
+
+    fn operation(&self, _args: &serde_json::Value) -> ToolOperation {
+        ToolOperation::Read
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {

@@ -1,6 +1,9 @@
-use super::traits::{ChatMessage, ChatRequest, ChatResponse};
+use super::traits::{
+    ChatMessage, ChatRequest, ChatResponse, StreamChunk, StreamOptions, StreamResult,
+};
 use super::Provider;
 use async_trait::async_trait;
+use futures_util::stream;
 use std::collections::HashMap;
 
 /// A single route: maps a task hint to a provider + model combo.
@@ -27,7 +30,10 @@ pub struct RouterProvider {
 }
 
 impl RouterProvider {
-    pub fn with_cost_tracker(mut self, cost_tracker: Option<std::sync::Arc<crate::cost::CostTracker>>) -> Self {
+    pub fn with_cost_tracker(
+        mut self,
+        cost_tracker: Option<std::sync::Arc<crate::cost::CostTracker>>,
+    ) -> Self {
         self.cost_tracker = cost_tracker;
         self
     }
@@ -173,6 +179,43 @@ impl Provider for RouterProvider {
             .any(|(_, provider)| provider.supports_vision())
     }
 
+    fn supports_streaming(&self) -> bool {
+        self.providers
+            .iter()
+            .any(|(_, provider)| provider.supports_streaming())
+    }
+
+    fn stream_chat_with_system(
+        &self,
+        system_prompt: Option<&str>,
+        message: &str,
+        model: &str,
+        temperature: f64,
+        options: StreamOptions,
+    ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+        let (provider_idx, resolved_model) = self.resolve(model);
+        let (_, provider) = &self.providers[provider_idx];
+        provider.stream_chat_with_system(
+            system_prompt,
+            message,
+            &resolved_model,
+            temperature,
+            options,
+        )
+    }
+
+    fn stream_chat(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: f64,
+        options: StreamOptions,
+    ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+        let (provider_idx, resolved_model) = self.resolve(model);
+        let (_, provider) = &self.providers[provider_idx];
+        provider.stream_chat(request, &resolved_model, temperature, options)
+    }
+
     async fn warmup(&self) -> anyhow::Result<()> {
         for (name, provider) in &self.providers {
             tracing::info!(provider = name, "Warming up routed provider");
@@ -187,6 +230,7 @@ impl Provider for RouterProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::StreamExt;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
@@ -226,6 +270,29 @@ mod tests {
             self.calls.fetch_add(1, Ordering::SeqCst);
             *self.last_model.lock() = model.to_string();
             Ok(self.response.to_string())
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            model: &str,
+            _temperature: f64,
+            _options: StreamOptions,
+        ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            *self.last_model.lock() = model.to_string();
+            let chunk = StreamChunk {
+                delta: self.response.to_string(),
+                reasoning_delta: None,
+                tool_call_deltas: Vec::new(),
+                is_final: true,
+                token_count: 0,
+            };
+            stream::once(async move { Ok(chunk) }).boxed()
         }
     }
 
@@ -280,6 +347,21 @@ mod tests {
             self.as_ref()
                 .chat_with_system(system_prompt, message, model, temperature)
                 .await
+        }
+
+        fn supports_streaming(&self) -> bool {
+            self.as_ref().supports_streaming()
+        }
+
+        fn stream_chat(
+            &self,
+            request: ChatRequest<'_>,
+            model: &str,
+            temperature: f64,
+            options: StreamOptions,
+        ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+            self.as_ref()
+                .stream_chat(request, model, temperature, options)
         }
     }
 
@@ -466,6 +548,33 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.text.as_deref(), Some("smart-tool"));
+        assert_eq!(mocks[1].call_count(), 1);
+        assert_eq!(mocks[1].last_model(), "claude-opus");
+        assert_eq!(mocks[0].call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn stream_chat_routes_hint_correctly() {
+        let (router, mocks) = make_router(
+            vec![("fast", "fast-stream"), ("smart", "smart-stream")],
+            vec![("reasoning", "smart", "claude-opus")],
+        );
+
+        assert!(router.supports_streaming());
+
+        let request = ChatRequest {
+            messages: &[],
+            tools: None,
+        };
+        let chunks: Vec<_> = router
+            .stream_chat(request, "hint:reasoning", 0.5, StreamOptions::default())
+            .collect()
+            .await;
+
+        assert_eq!(chunks.len(), 1);
+        let chunk = chunks.into_iter().next().unwrap().unwrap();
+        assert_eq!(chunk.delta, "smart-stream");
+        assert!(chunk.is_final);
         assert_eq!(mocks[1].call_count(), 1);
         assert_eq!(mocks[1].last_model(), "claude-opus");
         assert_eq!(mocks[0].call_count(), 0);

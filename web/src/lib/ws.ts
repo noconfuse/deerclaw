@@ -1,4 +1,4 @@
-import type { WsMessage } from '../types/api';
+import type { ApprovalDecision, SessionAutonomyLevel, WsMessage } from '../types/api';
 import { getToken } from './auth';
 
 export type WsMessageHandler = (msg: WsMessage) => void;
@@ -25,6 +25,7 @@ export class WebSocketClient {
   private currentDelay: number;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private intentionallyClosed = false;
+  private sessionId: string | null = null;
 
   public onMessage: WsMessageHandler | null = null;
   public onOpen: WsOpenHandler | null = null;
@@ -48,20 +49,38 @@ export class WebSocketClient {
 
   /** Open the WebSocket connection. */
   connect(): void {
+    if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) {
+      return;
+    }
     this.intentionallyClosed = false;
     this.clearReconnectTimer();
 
     const token = getToken();
-    const url = `${this.baseUrl}/ws/chat${token ? `?token=${encodeURIComponent(token)}` : ''}`;
+    const search = new URLSearchParams();
+    if (token) {
+      search.set('token', token);
+    }
+    if (this.sessionId) {
+      search.set('session', this.sessionId);
+    }
+    const query = search.toString();
+    const url = `${this.baseUrl}/ws/chat${query ? `?${query}` : ''}`;
 
-    this.ws = new WebSocket(url);
+    const socket = new WebSocket(url);
+    this.ws = socket;
 
-    this.ws.onopen = () => {
+    socket.onopen = () => {
+      if (this.ws !== socket) {
+        return;
+      }
       this.currentDelay = this.reconnectDelay;
       this.onOpen?.();
     };
 
-    this.ws.onmessage = (ev: MessageEvent) => {
+    socket.onmessage = (ev: MessageEvent) => {
+      if (this.ws !== socket) {
+        return;
+      }
       try {
         const msg = JSON.parse(ev.data) as WsMessage;
         this.onMessage?.(msg);
@@ -70,22 +89,74 @@ export class WebSocketClient {
       }
     };
 
-    this.ws.onclose = (ev: CloseEvent) => {
+    socket.onclose = (ev: CloseEvent) => {
+      if (this.ws !== socket) {
+        return;
+      }
       this.onClose?.(ev);
       this.scheduleReconnect();
     };
 
-    this.ws.onerror = (ev: Event) => {
+    socket.onerror = (ev: Event) => {
+      if (this.ws !== socket || this.intentionallyClosed) {
+        return;
+      }
       this.onError?.(ev);
     };
   }
 
+  setSession(sessionId: string | null): void {
+    if (this.sessionId === sessionId) {
+      return;
+    }
+    this.sessionId = sessionId;
+    const shouldReconnect =
+      this.ws &&
+      (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING);
+    if (shouldReconnect) {
+      this.disconnect();
+      this.connect();
+    }
+  }
+
   /** Send a chat message to the agent. */
-  sendMessage(content: string): void {
+  sendMessage(content: string, localPaths: string[] = []): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
       throw new Error('WebSocket is not connected');
     }
-    this.ws.send(JSON.stringify({ type: 'message', content }));
+    this.ws.send(
+      JSON.stringify({
+        type: 'message',
+        content,
+        local_paths: localPaths,
+      }),
+    );
+  }
+
+  /** Update execution policy for the current chat session. */
+  sendSessionPolicyUpdate(autonomyLevel: SessionAutonomyLevel): void {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      throw new Error('WebSocket is not connected');
+    }
+    this.ws.send(
+      JSON.stringify({
+        type: 'session_policy_update',
+        autonomy_level: autonomyLevel,
+      }),
+    );
+  }
+
+  sendApprovalResponse(requestId: string, decision: ApprovalDecision): void {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      throw new Error('WebSocket is not connected');
+    }
+    this.ws.send(
+      JSON.stringify({
+        type: 'approval_response',
+        request_id: requestId,
+        decision,
+      }),
+    );
   }
 
   /** Request the current agent run to stop. */
@@ -100,8 +171,10 @@ export class WebSocketClient {
   disconnect(): void {
     this.intentionallyClosed = true;
     this.clearReconnectTimer();
-    if (this.ws) {
-      this.ws.close();
+    const socket = this.ws;
+    this.ws = null;
+    if (socket) {
+      socket.close();
       this.ws = null;
     }
   }

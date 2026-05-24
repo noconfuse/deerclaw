@@ -61,6 +61,10 @@ impl ScreenshotTool {
             .get("filename")
             .and_then(|v| v.as_str())
             .map_or_else(|| format!("screenshot_{timestamp}.png"), String::from);
+        let include_base64 = args
+            .get("include_base64")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
 
         // Sanitize filename to prevent path traversal
         let safe_name = PathBuf::from(&filename).file_name().map_or_else(
@@ -132,7 +136,7 @@ impl ScreenshotTool {
                     });
                 }
 
-                Self::read_and_encode(&output_path).await
+                Self::read_and_encode(&output_path, include_base64).await
             }
             Ok(Err(e)) => Ok(ToolResult {
                 success: false,
@@ -149,8 +153,10 @@ impl ScreenshotTool {
         }
     }
 
-    /// Read the screenshot file and return base64-encoded result.
-    async fn read_and_encode(output_path: &std::path::Path) -> anyhow::Result<ToolResult> {
+    async fn read_and_encode(
+        output_path: &std::path::Path,
+        include_base64: bool,
+    ) -> anyhow::Result<ToolResult> {
         // Check file size before reading to prevent OOM on large screenshots
         const MAX_RAW_BYTES: u64 = 1_572_864; // ~1.5 MB (base64 expands ~33%)
         if let Ok(meta) = tokio::fs::metadata(output_path).await {
@@ -165,6 +171,17 @@ impl ScreenshotTool {
                     error: None,
                 });
             }
+        }
+
+        if !include_base64 {
+            return Ok(ToolResult {
+                success: true,
+                output: format!(
+                    "Screenshot saved to: {}\nBase64 omitted to preserve model context window. Set include_base64=true only when strictly needed.",
+                    output_path.display()
+                ),
+                error: None,
+            });
         }
 
         match tokio::fs::read(output_path).await {
@@ -218,7 +235,7 @@ impl Tool for ScreenshotTool {
     }
 
     fn description(&self) -> &str {
-        "Capture a screenshot of the current screen. Returns the file path and base64-encoded PNG data."
+        "Capture a screenshot of the current desktop screen. This captures the currently visible OS display, not hidden/background browser automation pages. For webpage captures, use browser action='screenshot' or action='screen_capture'. Returns saved file path by default; pass include_base64=true only when strictly necessary."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -232,19 +249,16 @@ impl Tool for ScreenshotTool {
                 "region": {
                     "type": "string",
                     "description": "Optional region for macOS: 'selection' for interactive crop, 'window' for front window. Ignored on Linux."
+                },
+                "include_base64": {
+                    "type": "boolean",
+                    "description": "Whether to include data:image/...;base64 payload in tool output. Default false to avoid exploding model context."
                 }
             }
         })
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        if !self.security.can_act() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Action blocked: autonomy is read-only".into()),
-            });
-        }
         self.capture(args).await
     }
 }

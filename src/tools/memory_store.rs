@@ -97,7 +97,7 @@ impl Tool for MemoryStoreTool {
 mod tests {
     use super::*;
     use crate::memory::SqliteMemory;
-    use crate::security::{AutonomyLevel, SecurityPolicy};
+    use crate::security::SecurityPolicy;
     use tempfile::TempDir;
 
     fn test_security() -> Arc<SecurityPolicy> {
@@ -178,27 +178,6 @@ mod tests {
         let tool = MemoryStoreTool::new(mem, test_security());
         let result = tool.execute(json!({"key": "no_content"})).await;
         assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn store_blocked_in_readonly_mode() {
-        let (_tmp, mem) = test_mem();
-        let readonly = Arc::new(SecurityPolicy {
-            autonomy: AutonomyLevel::ReadOnly,
-            ..SecurityPolicy::default()
-        });
-        let tool = MemoryStoreTool::new(mem.clone(), readonly);
-        let result = tool
-            .execute(json!({"key": "lang", "content": "Prefers Rust"}))
-            .await
-            .unwrap();
-        assert!(!result.success);
-        assert!(result
-            .error
-            .as_deref()
-            .unwrap_or("")
-            .contains("read-only mode"));
-        assert!(mem.get("lang").await.unwrap().is_none());
     }
 
     #[tokio::test]

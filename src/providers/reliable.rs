@@ -251,7 +251,10 @@ impl ReliableProvider {
         }
     }
 
-    pub fn with_cost_tracker(mut self, cost_tracker: Option<std::sync::Arc<crate::cost::CostTracker>>) -> Self {
+    pub fn with_cost_tracker(
+        mut self,
+        cost_tracker: Option<std::sync::Arc<crate::cost::CostTracker>>,
+    ) -> Self {
         self.cost_tracker = cost_tracker;
         self
     }
@@ -789,6 +792,61 @@ impl Provider for ReliableProvider {
 
     fn supports_streaming(&self) -> bool {
         self.providers.iter().any(|(_, p)| p.supports_streaming())
+    }
+
+    fn stream_chat(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: f64,
+        options: StreamOptions,
+    ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+        for (provider_name, provider) in &self.providers {
+            if !provider.supports_streaming() || !options.enabled {
+                continue;
+            }
+
+            let provider_clone = provider_name.clone();
+            let current_model = match self.model_chain(model).first() {
+                Some(m) => m.to_string(),
+                None => model.to_string(),
+            };
+
+            let request = ChatRequest {
+                messages: request.messages,
+                tools: request.tools,
+            };
+            let stream = provider.stream_chat(request, &current_model, temperature, options);
+            let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(100);
+
+            tokio::spawn(async move {
+                let mut stream = stream;
+                while let Some(chunk) = stream.next().await {
+                    if let Err(ref e) = chunk {
+                        tracing::warn!(
+                            provider = provider_clone,
+                            model = current_model,
+                            "Streaming error: {e}"
+                        );
+                    }
+                    if tx.send(chunk).await.is_err() {
+                        break;
+                    }
+                }
+            });
+
+            return stream::unfold(rx, |mut rx| async move {
+                rx.recv().await.map(|chunk| (chunk, rx))
+            })
+            .boxed();
+        }
+
+        stream::once(async move {
+            Err(super::traits::StreamError::Provider(
+                "No provider supports streaming".to_string(),
+            ))
+        })
+        .boxed()
     }
 
     fn stream_chat_with_system(

@@ -9,6 +9,7 @@ export interface StatusResponse {
   paired: boolean;
   channels: Record<string, boolean>;
   health: HealthSnapshot;
+  vision_supported: boolean;
 }
 
 export interface HealthSnapshot {
@@ -30,6 +31,7 @@ export interface ToolSpec {
   name: string;
   description: string;
   parameters: any;
+  operation?: 'read' | 'act';
 }
 
 export interface CronJob {
@@ -137,8 +139,28 @@ export interface SSEEvent {
   [key: string]: any;
 }
 
+export type SessionAutonomyLevel = 'supervised' | 'full';
+export type ApprovalDecision = 'yes' | 'no' | 'always';
+
+export interface SessionExecutionPolicy {
+  autonomy_level: SessionAutonomyLevel;
+  effective_autonomy_level: SessionAutonomyLevel;
+}
+
 export interface WsMessage {
-  type: 'message' | 'chunk' | 'tool_call' | 'tool_result' | 'done' | 'error' | 'stopped';
+  type:
+    | 'message'
+    | 'chunk'
+    | 'draft_clear'
+    | 'progress'
+    | 'reasoning'
+    | 'tool_call'
+    | 'tool_result'
+    | 'done'
+    | 'error'
+    | 'stopped'
+    | 'session_policy'
+    | 'approval_request';
   content?: string;
   full_response?: string;
   name?: string;
@@ -146,6 +168,18 @@ export interface WsMessage {
   output?: string;
   error?: string | null;
   message?: string;
+  append?: boolean;
+  progress_kind?: 'thinking' | 'tool_calls' | 'tool_start' | 'tool_finished';
+  round?: number;
+  count?: number;
+  seconds?: number;
+  success?: boolean;
+  tool_name?: string;
+  hint?: string;
+  autonomy_level?: SessionAutonomyLevel;
+  effective_autonomy_level?: SessionAutonomyLevel;
+  request_id?: string;
+  arguments?: any;
 }
 
 export interface ChatHistoryMessage {
@@ -163,8 +197,10 @@ export interface ChatHistoryResponse {
 
 export interface ChatSessionItem {
   session_id: string;
-  channel: string;
-  sender: string;
+  kind: 'task' | 'channel';
+  title: string;
+  channel: string | null;
+  sender: string | null;
   thread_ts: string | null;
   last_role: string;
   last_message: string;

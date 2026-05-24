@@ -183,11 +183,11 @@ fn autonomy_config_default_is_supervised() {
 }
 
 #[test]
-fn autonomy_config_default_max_actions_per_hour() {
+fn autonomy_config_default_legacy_action_limit() {
     let autonomy = AutonomyConfig::default();
     assert!(
-        autonomy.max_actions_per_hour > 0,
-        "max_actions_per_hour should be positive"
+        autonomy.legacy_action_limit > 0,
+        "legacy_action_limit should be positive"
     );
 }
 
@@ -203,13 +203,12 @@ fn autonomy_config_default_workspace_only() {
 #[test]
 fn autonomy_config_toml_roundtrip() {
     let mut config = Config::default();
-    config.autonomy.max_actions_per_hour = 50;
     config.autonomy.workspace_only = false;
 
     let toml_str = toml::to_string(&config).expect("config should serialize");
     let parsed: Config = toml::from_str(&toml_str).expect("should deserialize back");
 
-    assert_eq!(parsed.autonomy.max_actions_per_hour, 50);
+    assert_eq!(parsed.autonomy.legacy_action_limit, 50);
     assert!(!parsed.autonomy.workspace_only);
 }
 

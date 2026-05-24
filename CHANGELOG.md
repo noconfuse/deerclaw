@@ -46,7 +46,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Provider**: OpenRouter implementation (access Claude, GPT-4, Llama, Gemini via single API)
 - **Channels**: CLI channel with interactive and single-message modes
 - **Observability**: NoopObserver (zero overhead), LogObserver (tracing), MultiObserver (fan-out)
-- **Security**: Workspace sandboxing, command allowlisting, path traversal blocking, autonomy levels (ReadOnly/Supervised/Full), rate limiting
+- **Security**: Workspace sandboxing, command allowlisting, path traversal blocking, autonomy levels (Supervised/Full), rate limiting
 - **Tools**: Shell (sandboxed), FileRead (path-checked), FileWrite (path-checked)
 - **Memory (Brain)**: SQLite persistent backend (searchable, survives restarts), Markdown backend (plain files, human-readable)
 - **Heartbeat Engine**: Periodic task execution from HEARTBEAT.md

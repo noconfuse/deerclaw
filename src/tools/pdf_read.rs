@@ -1,4 +1,5 @@
 use super::traits::{Tool, ToolResult};
+use crate::security::policy::ToolOperation;
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
@@ -57,6 +58,10 @@ impl Tool for PdfReadTool {
             },
             "required": ["path"]
         })
+    }
+
+    fn operation(&self, _args: &serde_json::Value) -> ToolOperation {
+        ToolOperation::Read
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
@@ -249,7 +254,6 @@ mod tests {
         Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
             workspace_dir: workspace,
-            max_actions_per_hour: max_actions,
             ..SecurityPolicy::default()
         })
     }

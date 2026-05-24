@@ -17,6 +17,7 @@
 
 pub mod browser;
 pub mod browser_open;
+pub mod canvas;
 pub mod cli_discovery;
 pub mod composio;
 pub mod content_search;
@@ -44,6 +45,9 @@ pub mod memory_forget;
 pub mod memory_recall;
 pub mod memory_store;
 pub mod model_routing_config;
+pub mod office_ops;
+pub mod office_read;
+pub mod onepassword;
 pub mod pdf_read;
 pub mod proxy_config;
 pub mod pushover;
@@ -57,6 +61,7 @@ pub mod web_search_tool;
 
 pub use browser::{BrowserTool, ComputerUseConfig};
 pub use browser_open::BrowserOpenTool;
+pub use canvas::CanvasTool;
 pub use composio::ComposioTool;
 pub use content_search::ContentSearchTool;
 pub use cron_add::CronAddTool;
@@ -83,6 +88,9 @@ pub use memory_forget::MemoryForgetTool;
 pub use memory_recall::MemoryRecallTool;
 pub use memory_store::MemoryStoreTool;
 pub use model_routing_config::ModelRoutingConfigTool;
+pub use office_ops::{OfficeAddTool, OfficeCreateTool, OfficeQueryTool, OfficeSetTool};
+pub use office_read::OfficeReadTool;
+pub use onepassword::OnePasswordTool;
 pub use pdf_read::PdfReadTool;
 pub use proxy_config::ProxyConfigTool;
 pub use pushover::PushoverTool;
@@ -128,6 +136,10 @@ impl Tool for ArcDelegatingTool {
 
     fn parameters_schema(&self) -> serde_json::Value {
         self.inner.parameters_schema()
+    }
+
+    fn operation(&self, args: &serde_json::Value) -> crate::security::policy::ToolOperation {
+        self.inner.operation(args)
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
@@ -239,14 +251,17 @@ pub fn all_tools_with_runtime(
             security.clone(),
             workspace_dir.to_path_buf(),
         )),
+        Arc::new(OnePasswordTool::new(security.clone())),
     ];
 
     if browser_config.enabled {
-        // Add legacy browser_open tool for simple URL opening
-        tool_arcs.push(Arc::new(BrowserOpenTool::new(
-            security.clone(),
-            browser_config.allowed_domains.clone(),
-        )));
+        if browser_config.open_tool_enabled {
+            // Add legacy browser_open tool for simple URL opening
+            tool_arcs.push(Arc::new(BrowserOpenTool::new(
+                security.clone(),
+                browser_config.allowed_domains.clone(),
+            )));
+        }
         // Add full browser automation tool (pluggable backend)
         tool_arcs.push(Arc::new(BrowserTool::new_with_backend(
             security.clone(),
@@ -257,11 +272,7 @@ pub fn all_tools_with_runtime(
             browser_config.native_webdriver_url.clone(),
             browser_config.native_chrome_path.clone(),
             ComputerUseConfig {
-                endpoint: browser_config.computer_use.endpoint.clone(),
-                api_key: browser_config.computer_use.api_key.clone(),
                 timeout_ms: browser_config.computer_use.timeout_ms,
-                allow_remote_endpoint: browser_config.computer_use.allow_remote_endpoint,
-                window_allowlist: browser_config.computer_use.window_allowlist.clone(),
                 max_coordinate_x: browser_config.computer_use.max_coordinate_x,
                 max_coordinate_y: browser_config.computer_use.max_coordinate_y,
             },
@@ -297,12 +308,21 @@ pub fn all_tools_with_runtime(
         )));
     }
 
-    // PDF extraction (feature-gated at compile time via rag-pdf)
+    // Document extraction tools.
     tool_arcs.push(Arc::new(PdfReadTool::new(security.clone())));
+    tool_arcs.push(Arc::new(OfficeReadTool::new(security.clone())));
+    tool_arcs.push(Arc::new(OfficeCreateTool::new(security.clone())));
+    tool_arcs.push(Arc::new(OfficeQueryTool::new(security.clone())));
+    tool_arcs.push(Arc::new(OfficeSetTool::new(security.clone())));
+    tool_arcs.push(Arc::new(OfficeAddTool::new(security.clone())));
 
     // Vision tools are always available
     tool_arcs.push(Arc::new(ScreenshotTool::new(security.clone())));
     tool_arcs.push(Arc::new(ImageInfoTool::new(security.clone())));
+    tool_arcs.push(Arc::new(CanvasTool::new(
+        security.clone(),
+        workspace_dir.to_path_buf(),
+    )));
 
     if let Some(key) = composio_key {
         if !key.is_empty() {
@@ -325,13 +345,14 @@ pub fn all_tools_with_runtime(
             (!trimmed_value.is_empty()).then(|| trimmed_value.to_owned())
         });
         let parent_tools = Arc::new(tool_arcs.clone());
-        let cost_tracker = match crate::cost::CostTracker::new(root_config.cost.clone(), workspace_dir) {
-            Ok(ct) => Some(Arc::new(ct)),
-            Err(e) => {
-                tracing::warn!("Failed to initialize cost tracker for delegate tool: {e}");
-                None
-            }
-        };
+        let cost_tracker =
+            match crate::cost::CostTracker::new(root_config.cost.clone(), workspace_dir) {
+                Ok(ct) => Some(Arc::new(ct)),
+                Err(e) => {
+                    tracing::warn!("Failed to initialize cost tracker for delegate tool: {e}");
+                    None
+                }
+            };
 
         let delegate_tool = DelegateTool::new_with_options(
             delegate_agents,
@@ -361,6 +382,7 @@ pub fn all_tools_with_runtime(
 mod tests {
     use super::*;
     use crate::config::{BrowserConfig, Config, MemoryConfig};
+    use crate::security::policy::ToolOperation;
     use tempfile::TempDir;
 
     fn test_config(tmp: &TempDir) -> Config {
@@ -417,6 +439,7 @@ mod tests {
         assert!(names.contains(&"schedule"));
         assert!(names.contains(&"model_routing_config"));
         assert!(names.contains(&"pushover"));
+        assert!(names.contains(&"onepassword"));
         assert!(names.contains(&"proxy_config"));
     }
 
@@ -459,7 +482,48 @@ mod tests {
         assert!(names.contains(&"content_search"));
         assert!(names.contains(&"model_routing_config"));
         assert!(names.contains(&"pushover"));
+        assert!(names.contains(&"onepassword"));
         assert!(names.contains(&"proxy_config"));
+    }
+
+    #[test]
+    fn all_tools_can_disable_legacy_browser_open_while_keeping_browser() {
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(crate::memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+
+        let browser = BrowserConfig {
+            enabled: true,
+            open_tool_enabled: false,
+            allowed_domains: vec!["example.com".into()],
+            session_name: None,
+            ..BrowserConfig::default()
+        };
+        let http = crate::config::HttpRequestConfig::default();
+        let cfg = test_config(&tmp);
+
+        let tools = all_tools(
+            Arc::new(Config::default()),
+            &security,
+            mem,
+            None,
+            None,
+            &browser,
+            &http,
+            &crate::config::WebFetchConfig::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &cfg,
+        );
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert!(!names.contains(&"browser_open"));
+        assert!(names.contains(&"browser"));
     }
 
     #[test]
@@ -505,6 +569,15 @@ mod tests {
                 tool.name()
             );
         }
+    }
+
+    #[test]
+    fn arc_delegating_tool_preserves_tool_operation() {
+        let tool = ArcDelegatingTool::boxed(Arc::new(OfficeReadTool::new(Arc::new(
+            SecurityPolicy::default(),
+        ))));
+
+        assert_eq!(tool.operation(&serde_json::json!({})), ToolOperation::Read);
     }
 
     #[test]
@@ -639,5 +712,40 @@ mod tests {
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(!names.contains(&"delegate"));
+    }
+
+    #[test]
+    fn all_tools_include_office_write_tools() {
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(crate::memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+        let browser = BrowserConfig::default();
+        let http = crate::config::HttpRequestConfig::default();
+        let cfg = test_config(&tmp);
+
+        let tools = all_tools(
+            Arc::new(Config::default()),
+            &security,
+            mem,
+            None,
+            None,
+            &browser,
+            &http,
+            &crate::config::WebFetchConfig::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &cfg,
+        );
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert!(names.contains(&"office_create"));
+        assert!(names.contains(&"office_query"));
+        assert!(names.contains(&"office_set"));
+        assert!(names.contains(&"office_add"));
     }
 }

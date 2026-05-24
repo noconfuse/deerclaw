@@ -112,14 +112,6 @@ impl Tool for PushoverTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        if !self.security.can_act() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Action blocked: autonomy is read-only".into()),
-            });
-        }
-
         if !self.security.record_action() {
             return Ok(ToolResult {
                 success: false,
@@ -221,10 +213,9 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
-    fn test_security(level: AutonomyLevel, max_actions_per_hour: u32) -> Arc<SecurityPolicy> {
+    fn test_security(level: AutonomyLevel) -> Arc<SecurityPolicy> {
         Arc::new(SecurityPolicy {
             autonomy: level,
-            max_actions_per_hour,
             workspace_dir: std::env::temp_dir(),
             ..SecurityPolicy::default()
         })
@@ -392,18 +383,6 @@ mod tests {
         let (token, user_key) = result.unwrap();
         assert_eq!(token, "quotedtoken");
         assert_eq!(user_key, "quoteduser");
-    }
-
-    #[tokio::test]
-    async fn execute_blocks_readonly_mode() {
-        let tool = PushoverTool::new(
-            test_security(AutonomyLevel::ReadOnly, 100),
-            PathBuf::from("/tmp"),
-        );
-
-        let result = tool.execute(json!({"message": "hello"})).await.unwrap();
-        assert!(!result.success);
-        assert!(result.error.unwrap().contains("read-only"));
     }
 
     #[tokio::test]

@@ -1,9 +1,9 @@
+use crate::cost::tracker::CostTracker;
 use crate::providers::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
     Provider, TokenUsage, ToolCall as ProviderToolCall,
 };
 use crate::tools::ToolSpec;
-use crate::cost::tracker::CostTracker;
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};

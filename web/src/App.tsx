@@ -4,11 +4,13 @@ import { useTranslation } from 'react-i18next';
 import Layout from './components/layout/Layout';
 import Dashboard from './pages/Dashboard';
 import AgentChat from './pages/AgentChat';
-import Tools from './pages/Tools';
 import Cron from './pages/Cron';
 import Integrations from './pages/Integrations';
 import Memory from './pages/Memory';
 import Config from './pages/Config';
+import Channels from './pages/Channels';
+import Permissions from './pages/Permissions';
+import DeerClawSettings from './pages/DeerClawSettings';
 import Cost from './pages/Cost';
 import Logs from './pages/Logs';
 import Doctor from './pages/Doctor';
@@ -18,6 +20,7 @@ import { AuthProvider, useAuth } from './hooks/useAuth';
 import { setLocale, type Locale } from './lib/i18n';
 import { getOnboardStatus } from './lib/api';
 import { Logo } from './components/ui/Logo';
+import GlobalToast from './components/ui/GlobalToast';
 
 // Locale context
 interface LocaleContextType {
@@ -157,20 +160,25 @@ function AppContent() {
 
   return (
     <LocaleContext.Provider value={{ locale, setAppLocale }}>
+      <GlobalToast />
       <Routes>
         <Route element={<Layout />}>
-          <Route path="/" element={<Dashboard />} />
+          <Route path="/" element={<Navigate to="/agent" replace />} />
+          <Route path="/dashboard" element={<Dashboard />} />
           <Route path="/agent" element={<AgentChat />} />
-          <Route path="/tools" element={<Tools />} />
+          <Route path="/tools" element={<Navigate to="/integrations?tab=capabilities" replace />} />
           <Route path="/cron" element={<Cron />} />
           <Route path="/integrations" element={<Integrations />} />
           <Route path="/memory" element={<Memory />} />
           <Route path="/config" element={<Config />} />
+          <Route path="/deerclaw-settings" element={<DeerClawSettings />} />
+          <Route path="/channels" element={<Channels />} />
+          <Route path="/permissions" element={<Permissions />} />
           <Route path="/cost" element={<Cost />} />
           <Route path="/logs" element={<Logs />} />
           <Route path="/doctor" element={<Doctor />} />
           <Route path="/skill-market" element={<SkillMarket />} />
-          <Route path="*" element={<Navigate to="/" replace />} />
+          <Route path="*" element={<Navigate to="/agent" replace />} />
         </Route>
       </Routes>
     </LocaleContext.Provider>

@@ -1451,11 +1451,10 @@ pub fn create_routed_provider_with_options(
         })
         .collect();
 
-    Ok(Box::new(router::RouterProvider::new(
-        providers,
-        routes,
-        default_model.to_string(),
-    ).with_cost_tracker(options.cost_tracker.clone())))
+    Ok(Box::new(
+        router::RouterProvider::new(providers, routes, default_model.to_string())
+            .with_cost_tracker(options.cost_tracker.clone()),
+    ))
 }
 
 /// Information about a supported provider for display purposes.

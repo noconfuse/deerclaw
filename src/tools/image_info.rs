@@ -1,4 +1,5 @@
 use super::traits::{Tool, ToolResult};
+use crate::security::policy::ToolOperation;
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
@@ -143,6 +144,10 @@ impl Tool for ImageInfoTool {
             },
             "required": ["path"]
         })
+    }
+
+    fn operation(&self, _args: &serde_json::Value) -> ToolOperation {
+        ToolOperation::Read
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {

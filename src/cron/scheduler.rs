@@ -140,13 +140,6 @@ async fn run_agent_job(
     security: &SecurityPolicy,
     job: &CronJob,
 ) -> (bool, String) {
-    if !security.can_act() {
-        return (
-            false,
-            "blocked by security policy: autonomy is read-only".to_string(),
-        );
-    }
-
     if security.is_rate_limited() {
         return (
             false,
@@ -389,13 +382,6 @@ async fn run_job_command_with_timeout(
     job: &CronJob,
     timeout: Duration,
 ) -> (bool, String) {
-    if !security.can_act() {
-        return (
-            false,
-            "blocked by security policy: autonomy is read-only".to_string(),
-        );
-    }
-
     if security.is_rate_limited() {
         return (
             false,
@@ -640,20 +626,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_job_command_blocks_readonly_mode() {
-        let tmp = TempDir::new().unwrap();
-        let mut config = test_config(&tmp).await;
-        config.autonomy.level = crate::security::AutonomyLevel::ReadOnly;
-        let job = test_job("echo should-not-run");
-        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
-
-        let (success, output) = run_job_command(&config, &security, &job).await;
-        assert!(!success);
-        assert!(output.contains("blocked by security policy"));
-        assert!(output.contains("read-only"));
-    }
-
-    #[tokio::test]
     async fn run_job_command_blocks_rate_limited() {
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp).await;
@@ -716,22 +688,6 @@ mod tests {
         let (success, output) = run_agent_job(&config, &security, &job).await;
         assert!(!success);
         assert!(output.contains("agent job failed:"));
-    }
-
-    #[tokio::test]
-    async fn run_agent_job_blocks_readonly_mode() {
-        let tmp = TempDir::new().unwrap();
-        let mut config = test_config(&tmp).await;
-        config.autonomy.level = crate::security::AutonomyLevel::ReadOnly;
-        let mut job = test_job("");
-        job.job_type = JobType::Agent;
-        job.prompt = Some("Say hello".into());
-        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
-
-        let (success, output) = run_agent_job(&config, &security, &job).await;
-        assert!(!success);
-        assert!(output.contains("blocked by security policy"));
-        assert!(output.contains("read-only"));
     }
 
     #[tokio::test]

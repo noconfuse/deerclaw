@@ -263,7 +263,7 @@ Lưu ý:
 
 | Khóa | Mặc định | Mục đích |
 |---|---|---|
-| `level` | `supervised` | `read_only`, `supervised` hoặc `full` |
+| `level` | `supervised` | `supervised` hoặc `full` |
 | `workspace_only` | `true` | Giới hạn ghi/lệnh trong phạm vi workspace |
 | `allowed_commands` | _bắt buộc để chạy shell_ | Danh sách lệnh được phép |
 | `forbidden_paths` | `[]` | Danh sách đường dẫn bị cấm |

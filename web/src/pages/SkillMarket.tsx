@@ -20,9 +20,11 @@ import {
   auditSkill,
   removeSkill,
 } from '@/lib/api';
+import { useNotify } from '@/hooks/useNotify';
 
 export default function SkillMarket() {
   const { t } = useTranslation();
+  const notify = useNotify();
   const PAGE_SIZE = 12;
   const [items, setItems] = useState<SkillMarketItem[]>([]);
   const [skills, setSkills] = useState<SkillSpec[]>([]);
@@ -33,8 +35,6 @@ export default function SkillMarket() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [installingId, setInstallingId] = useState<string | null>(null);
-  const [success, setSuccess] = useState<string | null>(null);
-  const [actionError, setActionError] = useState<string | null>(null);
   const [riskOpen, setRiskOpen] = useState(false);
   const [acknowledgeRisk, setAcknowledgeRisk] = useState(false);
   const [selectedItem, setSelectedItem] = useState<SkillMarketItem | null>(null);
@@ -56,7 +56,11 @@ export default function SkillMarket() {
         setSkills(skills);
         setInstalledNames(new Set(skills.map((s) => s.name)));
       })
-      .catch((err) => setError(err instanceof Error ? err.message : t('skill_market.load_failed')))
+      .catch((err) => {
+        const message = err instanceof Error ? err.message : t('skill_market.load_failed');
+        setError(message);
+        notify.error(message, { key: 'skill-market:load' });
+      })
       .finally(() => setLoading(false));
   }, [t]);
 
@@ -126,8 +130,6 @@ export default function SkillMarket() {
     setSelectedItem(item);
     setAcknowledgeRisk(false);
     setRiskOpen(true);
-    setSuccess(null);
-    setActionError(null);
   };
 
   const closeInstallRisk = () => {
@@ -141,21 +143,21 @@ export default function SkillMarket() {
       return;
     }
     setInstallingId(selectedItem.id);
-    setActionError(null);
-    setSuccess(null);
     try {
       const result = await installSkillFromMarket(selectedItem.id, acknowledgeRisk);
       await refreshSkills();
-      setSuccess(
+      notify.success(
         t('skill_market.install_success', {
           name: getMarketName(selectedItem),
           dir: result.installed_dir,
           files: result.files_scanned,
         }),
+        { key: 'skill-market:install:success' },
       );
       closeInstallRisk();
     } catch (err: unknown) {
-      setActionError(err instanceof Error ? err.message : t('skill_market.install_failed'));
+      const message = err instanceof Error ? err.message : t('skill_market.install_failed');
+      notify.error(message, { key: 'skill-market:install:error' });
     } finally {
       setInstallingId(null);
     }
@@ -164,25 +166,25 @@ export default function SkillMarket() {
   const handleInstallSource = async () => {
     const source = skillSource.trim();
     if (!source) {
-      setActionError(t('tools.skills.source_required'));
-      setSuccess(null);
+      const message = t('tools.skills.source_required');
+      notify.error(message, { key: 'skill-market:source:required' });
       return;
     }
     setInstallingSource(true);
-    setActionError(null);
-    setSuccess(null);
     try {
       const result = await installSkill(source);
       await refreshSkills();
       setSkillSource('');
-      setSuccess(
+      notify.success(
         t('tools.skills.install_success', {
           dir: result.installed_dir,
           files: result.files_scanned,
         }),
+        { key: 'skill-market:source-install:success' },
       );
     } catch (err: unknown) {
-      setActionError(err instanceof Error ? err.message : t('tools.skills.install_failed'));
+      const message = err instanceof Error ? err.message : t('tools.skills.install_failed');
+      notify.error(message, { key: 'skill-market:source-install:error' });
     } finally {
       setInstallingSource(false);
     }
@@ -191,24 +193,24 @@ export default function SkillMarket() {
   const handleAuditSkill = async (source: string) => {
     const target = source.trim();
     if (!target) {
-      setActionError(t('tools.skills.source_required'));
-      setSuccess(null);
+      const message = t('tools.skills.source_required');
+      notify.error(message, { key: 'skill-market:audit:required' });
       return;
     }
     setAuditing(true);
-    setActionError(null);
-    setSuccess(null);
     setAuditResult(null);
     try {
       const result = await auditSkill(target);
       setAuditResult(result);
-      setSuccess(
+      notify.success(
         result.clean
           ? t('tools.skills.audit_clean', { files: result.files_scanned })
           : t('tools.skills.audit_risk', { count: result.findings.length }),
+        { key: 'skill-market:audit:success' },
       );
     } catch (err: unknown) {
-      setActionError(err instanceof Error ? err.message : t('tools.skills.audit_failed'));
+      const message = err instanceof Error ? err.message : t('tools.skills.audit_failed');
+      notify.error(message, { key: 'skill-market:audit:error' });
     } finally {
       setAuditing(false);
     }
@@ -219,14 +221,14 @@ export default function SkillMarket() {
       return;
     }
     setRemovingSkill(name);
-    setActionError(null);
-    setSuccess(null);
     try {
       await removeSkill(name);
       await refreshSkills();
-      setSuccess(t('tools.skills.remove_success', { name }));
+      const message = t('tools.skills.remove_success', { name });
+      notify.success(message, { key: 'skill-market:remove:success' });
     } catch (err: unknown) {
-      setActionError(err instanceof Error ? err.message : t('tools.skills.remove_failed'));
+      const message = err instanceof Error ? err.message : t('tools.skills.remove_failed');
+      notify.error(message, { key: 'skill-market:remove:error' });
     } finally {
       setRemovingSkill(null);
     }
@@ -265,18 +267,6 @@ export default function SkillMarket() {
           </div>
         </div>
       </div>
-
-      {(success || actionError) && (
-        <div
-          className={`rounded-lg border p-3 text-sm ${
-            success
-              ? 'bg-green-900/30 border-green-700 text-green-300'
-              : 'bg-red-900/30 border-red-700 text-red-300'
-          }`}
-        >
-          {success ?? actionError}
-        </div>
-      )}
 
       <div className="flex items-center gap-2 border-b border-gray-800">
         <button

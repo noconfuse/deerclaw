@@ -410,6 +410,7 @@ impl DelegateTool {
                 None,
                 None,
                 None,
+                None,
                 &[],
             ),
         )
@@ -473,6 +474,10 @@ impl Tool for ToolArcRef {
         self.inner.parameters_schema()
     }
 
+    fn operation(&self, args: &serde_json::Value) -> crate::security::policy::ToolOperation {
+        self.inner.operation(args)
+    }
+
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         self.inner.execute(args).await
     }
@@ -498,7 +503,7 @@ impl Observer for NoopObserver {
 mod tests {
     use super::*;
     use crate::providers::{ChatRequest, ChatResponse, ToolCall};
-    use crate::security::{AutonomyLevel, SecurityPolicy};
+    use crate::security::SecurityPolicy;
     use anyhow::anyhow;
 
     fn test_security() -> Arc<SecurityPolicy> {
@@ -570,6 +575,39 @@ mod tests {
             Ok(ToolResult {
                 success: true,
                 output: format!("echo:{value}"),
+                error: None,
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct ReadOnlyEchoTool;
+
+    #[async_trait]
+    impl Tool for ReadOnlyEchoTool {
+        fn name(&self) -> &str {
+            "read_only_echo_tool"
+        }
+
+        fn description(&self) -> &str {
+            "A deterministic read-only test tool."
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {}
+            })
+        }
+
+        fn operation(&self, _args: &serde_json::Value) -> ToolOperation {
+            ToolOperation::Read
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            Ok(ToolResult {
+                success: true,
+                output: "ok".to_string(),
                 error: None,
             })
         }
@@ -712,6 +750,13 @@ mod tests {
     }
 
     #[test]
+    fn tool_arc_ref_preserves_tool_operation() {
+        let wrapped = ToolArcRef::new(Arc::new(ReadOnlyEchoTool));
+
+        assert_eq!(wrapped.operation(&json!({})), ToolOperation::Read);
+    }
+
+    #[test]
     fn schema_lists_agent_names() {
         let tool = DelegateTool::new(sample_agents(), None, test_security());
         let schema = tool.parameters_schema();
@@ -845,25 +890,6 @@ mod tests {
                     .unwrap_or("")
                     .contains("Unknown agent")
         );
-    }
-
-    #[tokio::test]
-    async fn delegation_blocked_in_readonly_mode() {
-        let readonly = Arc::new(SecurityPolicy {
-            autonomy: AutonomyLevel::ReadOnly,
-            ..SecurityPolicy::default()
-        });
-        let tool = DelegateTool::new(sample_agents(), None, readonly);
-        let result = tool
-            .execute(json!({"agent": "researcher", "prompt": "test"}))
-            .await
-            .unwrap();
-        assert!(!result.success);
-        assert!(result
-            .error
-            .as_deref()
-            .unwrap_or("")
-            .contains("read-only mode"));
     }
 
     #[tokio::test]

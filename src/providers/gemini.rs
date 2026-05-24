@@ -5,8 +5,8 @@
 //! - Google Cloud ADC (`GOOGLE_APPLICATION_CREDENTIALS`)
 
 use crate::auth::AuthService;
-use crate::providers::traits::{ChatMessage, ChatResponse, Provider, TokenUsage};
 use crate::cost::CostTracker;
+use crate::providers::traits::{ChatMessage, ChatResponse, Provider, TokenUsage};
 use async_trait::async_trait;
 use base64::Engine;
 use directories::UserDirs;

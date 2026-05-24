@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import {
   Wrench,
   Search,
@@ -6,13 +6,16 @@ import {
   ChevronRight,
   Terminal,
   Package,
+  ShieldAlert,
 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import type { ToolSpec, CliTool } from '@/types/api';
-import { getTools, getCliTools } from '@/lib/api';
+import { getCliTools, getTools } from '@/lib/api';
+import { useNotify } from '@/hooks/useNotify';
 
 export default function Tools() {
   const { t } = useTranslation();
+  const notify = useNotify();
   const [tools, setTools] = useState<ToolSpec[]>([]);
   const [cliTools, setCliTools] = useState<CliTool[]>([]);
   const [search, setSearch] = useState('');
@@ -27,28 +30,32 @@ export default function Tools() {
 
   useEffect(() => {
     Promise.all([getTools(), getCliTools()])
-      .then(([t, c]) => {
-        setTools(t);
-        setCliTools(c);
+      .then(([toolSpecs, discoveredCli]) => {
+        setTools(toolSpecs);
+        setCliTools(discoveredCli);
       })
-      .catch((err) => setError(err.message))
+      .catch((err) => {
+        const message = err instanceof Error ? err.message : t('tools.load_failed');
+        setError(message);
+        notify.error(message, { key: 'tools:load' });
+      })
       .finally(() => setLoading(false));
-  }, []);
+  }, [notify, t]);
 
   const filtered = tools.filter(
-    (t) =>
-      getToolDisplayName(t.name).toLowerCase().includes(search.toLowerCase()) ||
-      getToolDisplayDescription(t.name, t.description)
+    (tool) =>
+      getToolDisplayName(tool.name).toLowerCase().includes(search.toLowerCase()) ||
+      getToolDisplayDescription(tool.name, tool.description)
         .toLowerCase()
         .includes(search.toLowerCase()) ||
-      t.name.toLowerCase().includes(search.toLowerCase()) ||
-      t.description.toLowerCase().includes(search.toLowerCase()),
+      tool.name.toLowerCase().includes(search.toLowerCase()) ||
+      tool.description.toLowerCase().includes(search.toLowerCase()),
   );
 
   const filteredCli = cliTools.filter(
-    (t) =>
-      t.name.toLowerCase().includes(search.toLowerCase()) ||
-      t.category.toLowerCase().includes(search.toLowerCase()),
+    (tool) =>
+      tool.name.toLowerCase().includes(search.toLowerCase()) ||
+      tool.category.toLowerCase().includes(search.toLowerCase()),
   );
 
   if (error) {
@@ -71,7 +78,14 @@ export default function Tools() {
 
   return (
     <div className="p-6 space-y-6">
-      {/* Search */}
+      <div className="rounded-xl border border-gray-800 bg-gray-900/80 p-5">
+        <div className="flex items-center gap-2">
+          <Wrench className="h-5 w-5 text-blue-400" />
+          <h1 className="text-base font-semibold text-white">{t('tools.title')}</h1>
+        </div>
+        <p className="mt-2 max-w-3xl text-sm text-gray-400">{t('tools.page_hint')}</p>
+      </div>
+
       <div className="relative max-w-md">
         <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-gray-500" />
         <input
@@ -91,6 +105,7 @@ export default function Tools() {
             {t('tools.agent_tools')} ({filtered.length})
           </h2>
         </div>
+        <p className="mb-4 max-w-3xl text-sm text-gray-400">{t('tools.agent_tools_hint')}</p>
 
         {filtered.length === 0 ? (
           <p className="text-sm text-gray-500">{t('tools.no_match')}</p>
@@ -111,15 +126,15 @@ export default function Tools() {
                   >
                     <div className="flex items-start justify-between gap-2">
                       <div className="flex items-center gap-2 min-w-0">
-                        <Package className="h-4 w-4 text-blue-400 flex-shrink-0 mt-0.5" />
+                        <Package className="mt-0.5 h-4 w-4 shrink-0 text-blue-400" />
                         <h3 className="text-sm font-semibold text-white truncate">
                           {getToolDisplayName(tool.name)}
                         </h3>
                       </div>
                       {isExpanded ? (
-                        <ChevronDown className="h-4 w-4 text-gray-400 flex-shrink-0" />
+                        <ChevronDown className="h-4 w-4 shrink-0 text-gray-400" />
                       ) : (
-                        <ChevronRight className="h-4 w-4 text-gray-400 flex-shrink-0" />
+                        <ChevronRight className="h-4 w-4 shrink-0 text-gray-400" />
                       )}
                     </div>
                     <p className="text-sm text-gray-400 mt-2 line-clamp-2">
@@ -153,6 +168,12 @@ export default function Tools() {
               {t('tools.cli_tools')} ({filteredCli.length})
             </h2>
           </div>
+          <div className="mb-4 flex items-start gap-3 rounded-xl border border-yellow-800/50 bg-yellow-950/20 p-4">
+            <ShieldAlert className="mt-0.5 h-5 w-5 shrink-0 text-yellow-400" />
+            <div className="min-w-0">
+              <p className="text-sm font-medium text-yellow-200">{t('tools.cli_policy_hint')}</p>
+            </div>
+          </div>
 
           <div className="bg-gray-900 rounded-xl border border-gray-800 overflow-hidden">
             <table className="w-full text-sm">
@@ -178,15 +199,11 @@ export default function Tools() {
                     key={tool.name}
                     className="border-b border-gray-800/50 hover:bg-gray-800/30 transition-colors"
                   >
-                    <td className="px-4 py-3 text-white font-medium">
-                      {tool.name}
-                    </td>
+                    <td className="px-4 py-3 text-white font-medium">{tool.name}</td>
                     <td className="px-4 py-3 text-gray-400 font-mono text-xs truncate max-w-[200px]">
                       {tool.path}
                     </td>
-                    <td className="px-4 py-3 text-gray-400">
-                      {tool.version ?? '-'}
-                    </td>
+                    <td className="px-4 py-3 text-gray-400">{tool.version ?? '-'}</td>
                     <td className="px-4 py-3">
                       <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-gray-800 text-gray-300 capitalize">
                         {tool.category}
@@ -199,7 +216,6 @@ export default function Tools() {
           </div>
         </div>
       )}
-
     </div>
   );
 }

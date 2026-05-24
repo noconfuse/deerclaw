@@ -3,29 +3,24 @@
 //! By default this uses Vercel's `agent-browser` CLI for automation.
 //! Optionally, a Rust-native backend can be enabled at build time via
 //! `--features browser-native` and selected through config.
-//! Computer-use (OS-level) actions are supported via an optional sidecar endpoint.
+//! Computer-use (OS-level) actions are routed through an internal compatibility layer.
 
 use super::traits::{Tool, ToolResult};
 use crate::security::SecurityPolicy;
-use anyhow::Context;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::net::ToSocketAddrs;
 use std::process::Stdio;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::process::Command;
 use tracing::debug;
+
+const DEFAULT_AGENT_BROWSER_SESSION: &str = "zeroclaw-main";
 
 /// Computer-use sidecar settings.
 #[derive(Clone)]
 pub struct ComputerUseConfig {
-    pub endpoint: String,
-    pub api_key: Option<String>,
     pub timeout_ms: u64,
-    pub allow_remote_endpoint: bool,
-    pub window_allowlist: Vec<String>,
     pub max_coordinate_x: Option<i64>,
     pub max_coordinate_y: Option<i64>,
 }
@@ -33,10 +28,7 @@ pub struct ComputerUseConfig {
 impl std::fmt::Debug for ComputerUseConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ComputerUseConfig")
-            .field("endpoint", &self.endpoint)
             .field("timeout_ms", &self.timeout_ms)
-            .field("allow_remote_endpoint", &self.allow_remote_endpoint)
-            .field("window_allowlist", &self.window_allowlist)
             .field("max_coordinate_x", &self.max_coordinate_x)
             .field("max_coordinate_y", &self.max_coordinate_y)
             .finish_non_exhaustive()
@@ -46,11 +38,7 @@ impl std::fmt::Debug for ComputerUseConfig {
 impl Default for ComputerUseConfig {
     fn default() -> Self {
         Self {
-            endpoint: "http://127.0.0.1:8787/v1/actions".into(),
-            api_key: None,
             timeout_ms: 15_000,
-            allow_remote_endpoint: false,
-            window_allowlist: Vec::new(),
             max_coordinate_x: None,
             max_coordinate_y: None,
         }
@@ -115,17 +103,6 @@ impl BrowserBackendKind {
 struct AgentBrowserResponse {
     success: bool,
     data: Option<Value>,
-    error: Option<String>,
-}
-
-/// Response format from computer-use sidecar.
-#[derive(Debug, Deserialize)]
-struct ComputerUseResponse {
-    #[serde(default)]
-    success: Option<bool>,
-    #[serde(default)]
-    data: Option<Value>,
-    #[serde(default)]
     error: Option<String>,
 }
 
@@ -279,50 +256,14 @@ impl BrowserTool {
         }
     }
 
-    fn computer_use_endpoint_url(&self) -> anyhow::Result<reqwest::Url> {
-        if self.computer_use.timeout_ms == 0 {
-            anyhow::bail!("browser.computer_use.timeout_ms must be > 0");
+    async fn resolve_builtin_computer_use_delegate(&self) -> Option<ResolvedBackend> {
+        if Self::rust_native_compiled() && self.rust_native_available() {
+            return Some(ResolvedBackend::RustNative);
         }
-
-        let endpoint = self.computer_use.endpoint.trim();
-        if endpoint.is_empty() {
-            anyhow::bail!("browser.computer_use.endpoint cannot be empty");
+        if Self::is_agent_browser_available().await {
+            return Some(ResolvedBackend::AgentBrowser);
         }
-
-        let parsed = reqwest::Url::parse(endpoint).map_err(|_| {
-            anyhow::anyhow!(
-                "Invalid browser.computer_use.endpoint: '{endpoint}'. Expected http(s) URL"
-            )
-        })?;
-
-        let scheme = parsed.scheme();
-        if scheme != "http" && scheme != "https" {
-            anyhow::bail!("browser.computer_use.endpoint must use http:// or https://");
-        }
-
-        let host = parsed
-            .host_str()
-            .ok_or_else(|| anyhow::anyhow!("browser.computer_use.endpoint must include host"))?;
-
-        let host_is_private = is_private_host(host);
-        if !self.computer_use.allow_remote_endpoint && !host_is_private {
-            anyhow::bail!(
-                "browser.computer_use.endpoint host '{host}' is public. Set browser.computer_use.allow_remote_endpoint=true to allow it"
-            );
-        }
-
-        if self.computer_use.allow_remote_endpoint && !host_is_private && scheme != "https" {
-            anyhow::bail!(
-                "browser.computer_use.endpoint must use https:// when allow_remote_endpoint=true and host is public"
-            );
-        }
-
-        Ok(parsed)
-    }
-
-    fn computer_use_available(&self) -> anyhow::Result<bool> {
-        let endpoint = self.computer_use_endpoint_url()?;
-        Ok(endpoint_reachable(&endpoint, Duration::from_millis(500)))
+        None
     }
 
     async fn resolve_backend(&self) -> anyhow::Result<ResolvedBackend> {
@@ -353,10 +294,11 @@ impl BrowserTool {
                 Ok(ResolvedBackend::RustNative)
             }
             BrowserBackendKind::ComputerUse => {
-                if !self.computer_use_available()? {
-                    anyhow::bail!(
-                        "browser.backend='computer_use' but sidecar endpoint is unreachable. Check browser.computer_use.endpoint and sidecar status"
-                    );
+                if self.computer_use.timeout_ms == 0 {
+                    anyhow::bail!("browser.computer_use.timeout_ms must be > 0");
+                }
+                if self.resolve_builtin_computer_use_delegate().await.is_none() {
+                    anyhow::bail!("browser.backend='computer_use' requires agent-browser CLI or rust-native backend");
                 }
                 Ok(ResolvedBackend::ComputerUse)
             }
@@ -367,32 +309,8 @@ impl BrowserTool {
                 if Self::is_agent_browser_available().await {
                     return Ok(ResolvedBackend::AgentBrowser);
                 }
-
-                let computer_use_err = match self.computer_use_available() {
-                    Ok(true) => return Ok(ResolvedBackend::ComputerUse),
-                    Ok(false) => None,
-                    Err(err) => Some(err.to_string()),
-                };
-
-                if Self::rust_native_compiled() {
-                    if let Some(err) = computer_use_err {
-                        anyhow::bail!(
-                            "browser.backend='auto' found no usable backend (agent-browser missing, rust-native unavailable, computer-use invalid: {err})"
-                        );
-                    }
-                    anyhow::bail!(
-                        "browser.backend='auto' found no usable backend (agent-browser missing, rust-native unavailable, computer-use sidecar unreachable)"
-                    )
-                }
-
-                if let Some(err) = computer_use_err {
-                    anyhow::bail!(
-                        "browser.backend='auto' needs agent-browser CLI, browser-native, or valid computer-use sidecar (error: {err})"
-                    );
-                }
-
                 anyhow::bail!(
-                    "browser.backend='auto' needs agent-browser CLI, browser-native, or computer-use sidecar"
+                    "browser.backend='auto' needs agent-browser CLI or rust-native backend"
                 )
             }
         }
@@ -440,9 +358,14 @@ impl BrowserTool {
     async fn run_command(&self, args: &[&str]) -> anyhow::Result<AgentBrowserResponse> {
         let mut cmd = Command::new("agent-browser");
 
-        // Add session if configured
-        if let Some(ref session) = self.session_name {
-            cmd.arg("--session").arg(session);
+        let session_name = self
+            .session_name
+            .as_deref()
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or(DEFAULT_AGENT_BROWSER_SESSION);
+        cmd.arg("--session").arg(session_name);
+        if !self.native_headless {
+            cmd.arg("--headed");
         }
 
         // Add --json for machine-readable output
@@ -551,14 +474,39 @@ impl BrowserTool {
 
             BrowserAction::Screenshot { path, full_page } => {
                 let mut args = vec!["screenshot"];
-                if let Some(ref p) = path {
-                    args.push(p);
-                }
+                let path_str = if let Some(ref p) = path {
+                    self.security
+                        .workspace_dir
+                        .join(p)
+                        .to_string_lossy()
+                        .to_string()
+                } else {
+                    let ts = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    self.security
+                        .workspace_dir
+                        .join(format!("browser_screenshot_{ts}.png"))
+                        .to_string_lossy()
+                        .to_string()
+                };
+
+                args.push(&path_str);
+
                 if full_page {
                     args.push("--full");
                 }
                 let resp = self.run_command(&args).await?;
-                self.to_result(resp)
+                if resp.success {
+                    Ok(ToolResult {
+                        success: true,
+                        output: format!("Screenshot saved to: {path_str}\nBase64 omitted to preserve model context window. Set include_base64=true only when strictly needed."),
+                        error: None,
+                    })
+                } else {
+                    self.to_result(resp)
+                }
             }
 
             BrowserAction::Wait { selector, ms, text } => {
@@ -658,13 +606,29 @@ impl BrowserTool {
                             self.native_chrome_path.as_deref(),
                         )
                         .await
-                        .with_context(|| "rust_native backend retry after session reset failed")?
+                        .map_err(|err| {
+                            anyhow::anyhow!(
+                                "rust_native backend retry after session reset failed: {err}"
+                            )
+                        })?
+                }
+            };
+
+            let output_str = {
+                let action_str = output.get("action").and_then(|v| v.as_str()).unwrap_or("");
+                if action_str == "snapshot"
+                    || action_str == "screenshot"
+                    || action_str == "screen_capture"
+                {
+                    serde_json::to_string(&output).unwrap_or_default()
+                } else {
+                    serde_json::to_string_pretty(&output).unwrap_or_default()
                 }
             };
 
             Ok(ToolResult {
                 success: true,
-                output: serde_json::to_string_pretty(&output).unwrap_or_default(),
+                output: output_str,
                 error: None,
             })
         }
@@ -743,8 +707,6 @@ impl BrowserTool {
         action: &str,
         args: &Value,
     ) -> anyhow::Result<ToolResult> {
-        let endpoint = self.computer_use_endpoint_url()?;
-
         let mut params = args
             .as_object()
             .cloned()
@@ -752,103 +714,123 @@ impl BrowserTool {
         params.remove("action");
 
         self.validate_computer_use_action(action, &params)?;
+        self.execute_builtin_computer_use_action(action, args).await
+    }
 
-        let payload = json!({
-            "action": action,
-            "params": params,
-            "policy": {
-                "allowed_domains": self.allowed_domains,
-                "window_allowlist": self.computer_use.window_allowlist,
-                "max_coordinate_x": self.computer_use.max_coordinate_x,
-                "max_coordinate_y": self.computer_use.max_coordinate_y,
-            },
-            "metadata": {
-                "session_name": self.session_name,
-                "source": "zeroclaw.browser",
-                "version": env!("CARGO_PKG_VERSION"),
-            }
-        });
-
-        let client = crate::config::build_runtime_proxy_client("tool.browser");
-        let mut request = client
-            .post(endpoint)
-            .timeout(Duration::from_millis(self.computer_use.timeout_ms))
-            .json(&payload);
-
-        if let Some(api_key) = self.computer_use.api_key.as_deref() {
-            let token = api_key.trim();
-            if !token.is_empty() {
-                request = request.bearer_auth(token);
-            }
+    async fn execute_builtin_computer_use_action(
+        &self,
+        action: &str,
+        args: &Value,
+    ) -> anyhow::Result<ToolResult> {
+        if action == "screen_capture" {
+            let delegated_backend = match self.resolve_builtin_computer_use_delegate().await {
+                Some(backend) => backend,
+                None => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(
+                            "No builtin computer_use delegate available. Install agent-browser CLI or enable rust-native backend".into(),
+                        ),
+                    });
+                }
+            };
+            debug!(
+                configured_backend = %self.backend,
+                delegated_backend = %backend_name(delegated_backend),
+                action = "screen_capture",
+                "computer_use delegated backend selected"
+            );
+            let screenshot_action = BrowserAction::Screenshot {
+                path: args
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .map(std::string::ToString::to_string),
+                full_page: args
+                    .get("full_page")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            };
+            return self
+                .execute_action(screenshot_action, delegated_backend)
+                .await;
         }
 
-        let response = request.send().await.with_context(|| {
-            format!(
-                "Failed to call computer-use sidecar at {}",
-                self.computer_use.endpoint
-            )
-        })?;
-
-        let status = response.status();
-        let body = response
-            .text()
-            .await
-            .context("Failed to read computer-use sidecar response body")?;
-
-        if let Ok(parsed) = serde_json::from_str::<ComputerUseResponse>(&body) {
-            if status.is_success() && parsed.success.unwrap_or(true) {
-                let output = parsed
-                    .data
-                    .map(|data| serde_json::to_string_pretty(&data).unwrap_or_default())
-                    .unwrap_or_else(|| {
-                        serde_json::to_string_pretty(&json!({
-                            "backend": "computer_use",
-                            "action": action,
-                            "ok": true,
-                        }))
-                        .unwrap_or_default()
+        if action == "key_press" {
+            let delegated_backend = match self.resolve_builtin_computer_use_delegate().await {
+                Some(backend) => backend,
+                None => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(
+                            "No builtin computer_use delegate available. Install agent-browser CLI or enable rust-native backend".into(),
+                        ),
                     });
-
-                return Ok(ToolResult {
-                    success: true,
-                    output,
-                    error: None,
-                });
-            }
-
-            let error = parsed.error.or_else(|| {
-                if status.is_success() && parsed.success == Some(false) {
-                    Some("computer-use sidecar returned success=false".to_string())
-                } else {
-                    Some(format!(
-                        "computer-use sidecar request failed with status {status}"
-                    ))
                 }
-            });
+            };
+            debug!(
+                configured_backend = %self.backend,
+                delegated_backend = %backend_name(delegated_backend),
+                action = "key_press",
+                "computer_use delegated backend selected"
+            );
+            let key = match args.get("key").and_then(Value::as_str) {
+                Some(value) if !value.trim().is_empty() => value.trim().to_string(),
+                _ => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some("Missing 'key' for key_press".into()),
+                    });
+                }
+            };
+            return self
+                .execute_action(BrowserAction::Press { key }, delegated_backend)
+                .await;
+        }
 
+        if is_computer_use_only_action(action) {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error,
+                error: Some(format!(
+                    "Action '{action}' is not supported by internal computer_use backend"
+                )),
             });
         }
 
-        if status.is_success() {
-            return Ok(ToolResult {
-                success: true,
-                output: body,
-                error: None,
-            });
-        }
+        let delegated_backend = match self.resolve_builtin_computer_use_delegate().await {
+            Some(backend) => backend,
+            None => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(
+                        "No builtin computer_use delegate available. Install agent-browser CLI or enable rust-native backend".into(),
+                    ),
+                });
+            }
+        };
+        debug!(
+            configured_backend = %self.backend,
+            delegated_backend = %backend_name(delegated_backend),
+            action = %action,
+            "computer_use delegated backend selected"
+        );
 
-        Ok(ToolResult {
-            success: false,
-            output: String::new(),
-            error: Some(format!(
-                "computer-use sidecar request failed with status {status}: {}",
-                body.trim()
-            )),
-        })
+        let parsed_action = match parse_browser_action(action, args) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(error.to_string()),
+                });
+            }
+        };
+
+        self.execute_action(parsed_action, delegated_backend).await
     }
 
     async fn execute_action(
@@ -870,7 +852,15 @@ impl BrowserTool {
         if resp.success {
             let output = resp
                 .data
-                .map(|d| serde_json::to_string_pretty(&d).unwrap_or_default())
+                .map(|d| {
+                    let action = d.get("action").and_then(|v| v.as_str()).unwrap_or("");
+                    if action == "snapshot" || action == "screenshot" || action == "screen_capture"
+                    {
+                        serde_json::to_string(&d).unwrap_or_default()
+                    } else {
+                        serde_json::to_string_pretty(&d).unwrap_or_default()
+                    }
+                })
                 .unwrap_or_default();
             Ok(ToolResult {
                 success: true,
@@ -897,8 +887,9 @@ impl Tool for BrowserTool {
         concat!(
             "Web/browser automation with pluggable backends (agent-browser, rust-native, computer_use). ",
             "Supports DOM actions plus optional OS-level actions (mouse_move, mouse_click, mouse_drag, ",
-            "key_type, key_press, screen_capture) through a computer-use sidecar. Use 'snapshot' to map ",
-            "interactive elements to refs (@e1, @e2). Enforces browser.allowed_domains for open actions."
+            "key_type, key_press, screen_capture) through the internal computer_use layer. Use 'snapshot' to map ",
+            "interactive elements to refs (@e1, @e2). Enforces browser.allowed_domains for open actions. ",
+            "Use action='screenshot' or action='screen_capture' for webpage captures; call action='close' when finished to release browser session."
         )
     }
 
@@ -1018,14 +1009,6 @@ impl Tool for BrowserTool {
 
     async fn execute(&self, args: Value) -> anyhow::Result<ToolResult> {
         // Security checks
-        if !self.security.can_act() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Action blocked: autonomy is read-only".into()),
-            });
-        }
-
         if !self.security.record_action() {
             return Ok(ToolResult {
                 success: false,
@@ -1044,12 +1027,17 @@ impl Tool for BrowserTool {
                 });
             }
         };
+        debug!(
+            configured_backend = %self.backend,
+            resolved_backend = %backend_name(backend),
+            "browser backend resolved"
+        );
 
         // Parse action from args
         let action_str = args
             .get("action")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'action' parameter"))?;
+            .unwrap_or("snapshot");
 
         if !is_supported_browser_action(action_str) {
             return Ok(ToolResult {
@@ -1090,7 +1078,6 @@ impl Tool for BrowserTool {
 mod native_backend {
     use super::BrowserAction;
     use anyhow::{Context, Result};
-    use base64::Engine;
     use fantoccini::actions::{InputSource, MouseActions, PointerAction};
     use fantoccini::key::Key;
     use fantoccini::{Client, ClientBuilder, Locator};
@@ -1244,13 +1231,30 @@ mod native_backend {
                     });
 
                     if let Some(path_str) = path {
+                        // Resolve against workspace dir not available here natively since it's `NativeState`
+                        // but wait, `NativeState` doesn't have `workspace_dir`.
+                        // We will just write to the path provided (relative to zeroclaw cwd)
+                        // This is what it was doing before.
                         tokio::fs::write(&path_str, &png)
                             .await
                             .with_context(|| format!("Failed to write screenshot to {path_str}"))?;
                         payload["path"] = Value::String(path_str);
                     } else {
-                        payload["png_base64"] =
-                            Value::String(base64::engine::general_purpose::STANDARD.encode(&png));
+                        let ts = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        let fallback_path = format!("browser_screenshot_{ts}.png");
+                        tokio::fs::write(&fallback_path, &png)
+                            .await
+                            .with_context(|| {
+                                format!("Failed to write screenshot to {fallback_path}")
+                            })?;
+                        payload["path"] = Value::String(fallback_path);
+                        payload["note"] = Value::String(
+                            "Base64 omitted to preserve model context. Saved to file instead."
+                                .to_string(),
+                        );
                     }
 
                     Ok(payload)
@@ -1994,30 +1998,6 @@ fn normalize_domains(domains: Vec<String>) -> Vec<String> {
         .collect()
 }
 
-fn endpoint_reachable(endpoint: &reqwest::Url, timeout: Duration) -> bool {
-    let host = match endpoint.host_str() {
-        Some(host) if !host.is_empty() => host,
-        _ => return false,
-    };
-
-    let port = match endpoint.port_or_known_default() {
-        Some(port) => port,
-        None => return false,
-    };
-
-    let mut addrs = match (host, port).to_socket_addrs() {
-        Ok(addrs) => addrs,
-        Err(_) => return false,
-    };
-
-    let addr = match addrs.next() {
-        Some(addr) => addr,
-        None => return false,
-    };
-
-    std::net::TcpStream::connect_timeout(&addr, timeout).is_ok()
-}
-
 fn extract_host(url_str: &str) -> anyhow::Result<String> {
     // Simple host extraction without url crate
     let url = url_str.trim();
@@ -2322,44 +2302,40 @@ mod tests {
     }
 
     #[test]
-    fn computer_use_endpoint_rejects_public_http_by_default() {
-        let security = Arc::new(SecurityPolicy::default());
-        let tool = BrowserTool::new_with_backend(
-            security,
-            vec!["example.com".into()],
-            None,
-            "computer_use".into(),
-            true,
-            "http://127.0.0.1:9515".into(),
-            None,
-            ComputerUseConfig {
-                endpoint: "http://computer-use.example.com/v1/actions".into(),
-                ..ComputerUseConfig::default()
-            },
-        );
+    fn builtin_computer_use_rejects_os_only_actions_without_sidecar() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let security = Arc::new(SecurityPolicy::default());
+            let tool = BrowserTool::new_with_backend(
+                security,
+                vec!["example.com".into()],
+                None,
+                "computer_use".into(),
+                true,
+                "http://127.0.0.1:9515".into(),
+                None,
+                ComputerUseConfig::default(),
+            );
 
-        assert!(tool.computer_use_endpoint_url().is_err());
-    }
+            let args = json!({
+                "action": "mouse_move",
+                "x": 10,
+                "y": 20
+            });
 
-    #[test]
-    fn computer_use_endpoint_requires_https_for_public_remote() {
-        let security = Arc::new(SecurityPolicy::default());
-        let tool = BrowserTool::new_with_backend(
-            security,
-            vec!["example.com".into()],
-            None,
-            "computer_use".into(),
-            true,
-            "http://127.0.0.1:9515".into(),
-            None,
-            ComputerUseConfig {
-                endpoint: "https://computer-use.example.com/v1/actions".into(),
-                allow_remote_endpoint: true,
-                ..ComputerUseConfig::default()
-            },
-        );
-
-        assert!(tool.computer_use_endpoint_url().is_ok());
+            let result = tool
+                .execute_builtin_computer_use_action("mouse_move", &args)
+                .await
+                .unwrap();
+            assert!(!result.success);
+            assert!(result
+                .error
+                .unwrap_or_default()
+                .contains("not supported by internal computer_use backend"));
+        });
     }
 
     #[test]
@@ -2486,7 +2462,11 @@ mod tests {
     #[cfg(feature = "browser-native")]
     #[test]
     fn reset_session_is_idempotent_without_client() {
-        tokio_test::block_on(async {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
             let mut state = native_backend::NativeBrowserState::default();
             state.reset_session().await;
             state.reset_session().await;

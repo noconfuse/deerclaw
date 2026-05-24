@@ -39,14 +39,6 @@ impl ProxyConfigTool {
     }
 
     fn require_write_access(&self) -> Option<ToolResult> {
-        if !self.security.can_act() {
-            return Some(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Action blocked: autonomy is read-only".into()),
-            });
-        }
-
         if !self.security.record_action() {
             return Some(ToolResult {
                 success: false,

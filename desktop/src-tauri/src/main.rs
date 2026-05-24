@@ -3,19 +3,123 @@
     windows_subsystem = "windows"
 )]
 
+use anyhow::Context;
+use std::path::{Path, PathBuf};
 use tauri::Manager;
 use tracing::{error, info, warn};
+use tracing_subscriber::{fmt, EnvFilter};
+use zeroclaw::observability;
 use zeroclaw::{daemon, Config};
+
+const OFFICECLI_ENV_VAR: &str = "ZEROCLAW_OFFICECLI_PATH";
+const OFFICECLI_RESOURCE_ROOT: &str = "officecli";
+
+#[derive(Clone, Copy, Debug)]
+struct OfficeCliAsset {
+    resource_name: &'static str,
+}
+
+impl OfficeCliAsset {
+    fn resource_rel_path(self) -> PathBuf {
+        Path::new(OFFICECLI_RESOURCE_ROOT).join(self.resource_name)
+    }
+}
+
+fn current_officecli_asset() -> Option<OfficeCliAsset> {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") => Some(OfficeCliAsset {
+            resource_name: "officecli",
+        }),
+        ("macos", "x86_64") => Some(OfficeCliAsset {
+            resource_name: "officecli",
+        }),
+        ("windows", "x86_64") => Some(OfficeCliAsset {
+            resource_name: "officecli.exe",
+        }),
+        ("windows", "aarch64") => Some(OfficeCliAsset {
+            resource_name: "officecli.exe",
+        }),
+        ("linux", "x86_64") => Some(OfficeCliAsset {
+            resource_name: "officecli",
+        }),
+        ("linux", "aarch64") => Some(OfficeCliAsset {
+            resource_name: "officecli",
+        }),
+        _ => None,
+    }
+}
+
+fn bundled_officecli_path(app: &tauri::App) -> anyhow::Result<PathBuf> {
+    let asset = current_officecli_asset().with_context(|| {
+        format!(
+            "No bundled OfficeCLI asset mapping for platform {}-{}",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        )
+    })?;
+    let resource_rel_path = asset.resource_rel_path();
+    let resolved_path = app
+        .path_resolver()
+        .resolve_resource(&resource_rel_path)
+        .with_context(|| {
+            format!(
+                "Failed to resolve bundled OfficeCLI resource {}",
+                resource_rel_path.display()
+            )
+        })?;
+    let resource_path = if resolved_path.is_file() {
+        resolved_path
+    } else {
+        let dev_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("resources")
+            .join(&resource_rel_path);
+        if dev_path.is_file() {
+            dev_path
+        } else {
+            anyhow::bail!(
+                "Bundled OfficeCLI resource not found at {} or {}",
+                resolved_path.display(),
+                dev_path.display()
+            );
+        }
+    };
+    ensure_executable_permissions(&resource_path)?;
+    Ok(resource_path)
+}
+
+#[cfg(unix)]
+fn ensure_executable_permissions(path: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut permissions = std::fs::metadata(path)
+        .with_context(|| format!("failed to stat {}", path.display()))?
+        .permissions();
+    if permissions.mode() & 0o111 == 0o111 {
+        return Ok(());
+    }
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(path, permissions)
+        .with_context(|| format!("failed to mark {} executable", path.display()))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_executable_permissions(_path: &Path) -> anyhow::Result<()> {
+    Ok(())
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Setup minimal logging for the desktop app wrapper
-    tracing_subscriber::fmt().with_env_filter("info").init();
+    let subscriber = fmt::Subscriber::builder()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .finish();
+    let _ = tracing::subscriber::set_global_default(subscriber);
 
     // Install default crypto provider for rustls
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    // Initialize config
     let mut config = Config::load_or_init().await?;
 
     // Disable pairing for desktop app convenience
@@ -33,7 +137,6 @@ async fn main() -> anyhow::Result<()> {
             .push("desktop-internal-token".to_string());
     }
 
-    // Force binding to localhost for security since pairing is disabled
     config.gateway.host = "127.0.0.1".to_string();
 
     // Ensure we are using a known port for the desktop app
@@ -48,23 +151,36 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let host = config.gateway.host.clone();
-
-    // Clone config for the daemon task
-    let config_clone = config.clone();
-    let host_clone = host.clone();
-
-    // Spawn the daemon
-    tokio::spawn(async move {
-        info!("Starting embedded daemon on {}:{}", host_clone, port);
-        // daemon::run is now public thanks to the small change in src/lib.rs
-        if let Err(e) = daemon::run(config_clone, host_clone, port).await {
-            error!("Daemon failed: {}", e);
-        }
-    });
+    observability::runtime_trace::init_from_config(&config.observability, &config.workspace_dir);
 
     // Run Tauri
     tauri::Builder::default()
         .setup(move |app| {
+            #[cfg(target_os = "macos")]
+            app.set_activation_policy(tauri::ActivationPolicy::Regular);
+
+            match bundled_officecli_path(app) {
+                Ok(officecli_path) => {
+                    std::env::set_var(OFFICECLI_ENV_VAR, &officecli_path);
+                    info!(
+                        "Configured bundled OfficeCLI for desktop runtime: {}",
+                        officecli_path.display()
+                    );
+                }
+                Err(error) => {
+                    warn!("Bundled OfficeCLI is unavailable: {error}");
+                }
+            }
+
+            let config_clone = config.clone();
+            let host_clone = host.clone();
+            tokio::spawn(async move {
+                info!("Starting embedded daemon on {}:{}", host_clone, port);
+                if let Err(e) = daemon::run(config_clone, host_clone, port).await {
+                    error!("Daemon failed: {}", e);
+                }
+            });
+
             let main_window = app.get_window("main").unwrap();
             let update_window = main_window.clone();
             let url = format!("http://localhost:{}", port);
@@ -112,6 +228,8 @@ async fn main() -> anyhow::Result<()> {
             // I should set it dynamically here.
 
             let _ = main_window.eval(&format!("window.location.replace('{}')", url));
+            let _ = main_window.show();
+            let _ = main_window.set_focus();
             Ok(())
         })
         .run(tauri::generate_context!())

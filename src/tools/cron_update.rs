@@ -16,17 +16,7 @@ impl CronUpdateTool {
         Self { config, security }
     }
 
-    fn enforce_mutation_allowed(&self, action: &str) -> Option<ToolResult> {
-        if !self.security.can_act() {
-            return Some(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!(
-                    "Security policy: read-only mode, cannot perform '{action}'"
-                )),
-            });
-        }
-
+    fn enforce_mutation_allowed(&self, _action: &str) -> Option<ToolResult> {
         if self.security.is_rate_limited() {
             return Some(ToolResult {
                 success: false,
@@ -218,31 +208,6 @@ mod tests {
             .unwrap();
         assert!(!result.success);
         assert!(result.error.unwrap_or_default().contains("not allowed"));
-    }
-
-    #[tokio::test]
-    async fn blocks_mutation_in_read_only_mode() {
-        let tmp = TempDir::new().unwrap();
-        let mut config = Config {
-            workspace_dir: tmp.path().join("workspace"),
-            config_path: tmp.path().join("config.toml"),
-            ..Config::default()
-        };
-        config.autonomy.level = AutonomyLevel::ReadOnly;
-        std::fs::create_dir_all(&config.workspace_dir).unwrap();
-        let cfg = Arc::new(config);
-        let job = cron::add_job(&cfg, "*/5 * * * *", "echo ok").unwrap();
-        let tool = CronUpdateTool::new(cfg.clone(), test_security(&cfg));
-
-        let result = tool
-            .execute(json!({
-                "job_id": job.id,
-                "patch": { "enabled": false }
-            }))
-            .await
-            .unwrap();
-        assert!(!result.success);
-        assert!(result.error.unwrap_or_default().contains("read-only"));
     }
 
     #[tokio::test]

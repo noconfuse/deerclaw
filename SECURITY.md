@@ -33,7 +33,6 @@ Instead, please report them responsibly:
 ZeroClaw implements defense-in-depth security:
 
 ### Autonomy Levels
-- **ReadOnly** — Agent can only read, no shell or write access
 - **Supervised** — Agent can act within allowlists (default)
 - **Full** — Agent has full access within workspace sandbox
 

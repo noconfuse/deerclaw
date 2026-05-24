@@ -64,7 +64,7 @@ impl Tool for ShellTool {
     }
 
     fn description(&self) -> &str {
-        "Execute a shell command in the workspace directory"
+        "Execute a shell command in the workspace directory."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -73,7 +73,7 @@ impl Tool for ShellTool {
             "properties": {
                 "command": {
                     "type": "string",
-                    "description": "The shell command to execute"
+                    "description": "The shell command to execute."
                 },
                 "approved": {
                     "type": "boolean",
@@ -202,6 +202,7 @@ impl Tool for ShellTool {
 mod tests {
     use super::*;
     use crate::runtime::{NativeRuntime, RuntimeAdapter};
+    use crate::security::policy::with_approval_override;
     use crate::security::{AutonomyLevel, SecurityPolicy};
 
     fn test_security(autonomy: AutonomyLevel) -> Arc<SecurityPolicy> {
@@ -262,21 +263,6 @@ mod tests {
         assert!(!result.success);
         let error = result.error.as_deref().unwrap_or("");
         assert!(error.contains("not allowed") || error.contains("high-risk"));
-    }
-
-    #[tokio::test]
-    async fn shell_blocks_readonly() {
-        let tool = ShellTool::new(test_security(AutonomyLevel::ReadOnly), test_runtime());
-        let result = tool
-            .execute(json!({"command": "ls"}))
-            .await
-            .expect("readonly command execution should return a result");
-        assert!(!result.success);
-        assert!(result
-            .error
-            .as_ref()
-            .expect("error field should be present for blocked command")
-            .contains("not allowed"));
     }
 
     #[tokio::test]
@@ -545,6 +531,23 @@ mod tests {
 
         let _ =
             tokio::fs::remove_file(std::env::temp_dir().join("zeroclaw_shell_approval_test")).await;
+    }
+
+    #[tokio::test]
+    async fn shell_allows_unlisted_command_with_approval_override() {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            allowed_commands: vec!["git".into()],
+            workspace_dir: std::env::temp_dir(),
+            ..SecurityPolicy::default()
+        });
+        let tool = ShellTool::new(security, test_runtime());
+
+        let result =
+            with_approval_override(tool.execute(json!({"command": "which ls"}))).await.unwrap();
+        assert!(result.success);
+        assert!(result.error.is_none());
+        assert!(!result.output.trim().is_empty());
     }
 
     // ── §5.2 Shell timeout enforcement tests ─────────────────

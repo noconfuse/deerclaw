@@ -150,16 +150,6 @@ impl ScheduleTool {
             });
         }
 
-        if !self.security.can_act() {
-            return Some(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!(
-                    "Security policy: read-only mode, cannot perform '{action}'"
-                )),
-            });
-        }
-
         if !self.security.record_action() {
             return Some(ToolResult {
                 success: false,
@@ -413,10 +403,11 @@ mod tests {
         tokio::fs::create_dir_all(&config.workspace_dir)
             .await
             .unwrap();
-        let security = Arc::new(SecurityPolicy::from_config(
+        let security = SecurityPolicy::from_config(
             &config.autonomy,
             &config.workspace_dir,
-        ));
+        );
+        let security = Arc::new(security);
         (tmp, config, security)
     }
 
@@ -515,15 +506,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn readonly_blocks_mutating_actions() {
+    async fn supervised_config_allows_mutating_actions() {
         let tmp = TempDir::new().unwrap();
         let config = Config {
             workspace_dir: tmp.path().join("workspace"),
             config_path: tmp.path().join("config.toml"),
-            autonomy: crate::config::AutonomyConfig {
-                level: AutonomyLevel::ReadOnly,
-                ..Default::default()
-            },
             ..Config::default()
         };
         tokio::fs::create_dir_all(&config.workspace_dir)
@@ -536,7 +523,7 @@ mod tests {
 
         let tool = ScheduleTool::new(security, config);
 
-        let blocked = tool
+        let created = tool
             .execute(json!({
                 "action": "create",
                 "expression": "* * * * *",
@@ -544,11 +531,12 @@ mod tests {
             }))
             .await
             .unwrap();
-        assert!(!blocked.success);
-        assert!(blocked.error.as_deref().unwrap().contains("read-only"));
+        assert!(created.success);
+        assert!(created.output.contains("Created recurring job"));
 
         let list = tool.execute(json!({"action": "list"})).await.unwrap();
         assert!(list.success);
+        assert!(list.output.contains("echo blocked"));
     }
 
     #[tokio::test]

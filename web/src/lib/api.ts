@@ -16,6 +16,7 @@ import type {
   ChatSessionItem,
 } from '../types/api';
 import { clearToken, getToken, setToken } from './auth';
+import { notifyError } from './notifications';
 
 // ---------------------------------------------------------------------------
 // Base fetch wrapper
@@ -26,6 +27,12 @@ export class UnauthorizedError extends Error {
     super('Unauthorized');
     this.name = 'UnauthorizedError';
   }
+}
+
+export const CHAT_SESSIONS_UPDATED_EVENT = 'zeroclaw-chat-sessions-updated';
+
+export function emitChatSessionsUpdated(): void {
+  window.dispatchEvent(new Event(CHAT_SESSIONS_UPDATED_EVENT));
 }
 
 export async function apiFetch<T = unknown>(
@@ -193,10 +200,144 @@ export function getChatSessions(): Promise<ChatSessionItem[]> {
   ).then((data) => unwrapField(data, 'sessions'));
 }
 
-export function clearChatHistory(): Promise<{ deleted: number }> {
-  return apiFetch<{ deleted: number }>('/api/chat/history', {
+export function createChatSession(): Promise<{ session_id: string }> {
+  return apiFetch<{ session_id: string }>('/api/chat/sessions', {
+    method: 'POST',
+  });
+}
+
+export function deleteChatSession(sessionId: string): Promise<{ deleted: number }> {
+  return apiFetch<{ deleted: number }>(`/api/chat/sessions/${encodeURIComponent(sessionId)}`, {
     method: 'DELETE',
   });
+}
+
+export type UploadedChatAttachment = {
+  name: string;
+  mime_type: string;
+  size: number;
+  local_path: string;
+};
+
+export type ChatWorkspaceFile = {
+  name: string;
+  mime_type: string;
+  size: number;
+  workspace_path: string;
+  local_path: string;
+  relative_path: string;
+  kind: 'image' | 'text' | 'file' | 'directory';
+  text_preview?: string | null;
+  image_data_url?: string | null;
+};
+
+export type ChatWorkspaceResponse = {
+  scope_path: string;
+  files: ChatWorkspaceFile[];
+};
+
+export type ChatWorkspacePreview = {
+  name: string;
+  mime_type: string;
+  size: number;
+  workspace_path: string;
+  local_path: string;
+  relative_path: string;
+  kind: 'image' | 'text' | 'file' | 'directory';
+  html_preview?: string | null;
+  text_preview?: string | null;
+  outline_preview?: string | null;
+  image_data_url?: string | null;
+  preview_source?: string | null;
+};
+
+export async function openChatWorkspaceFolder(sessionId: string, relativePath: string): Promise<void> {
+  try {
+    return await apiFetch<void>('/api/chat/workspace/open-folder', {
+      method: 'POST',
+      body: JSON.stringify({
+        session: sessionId || null,
+        path: relativePath,
+      }),
+    });
+  } catch (error) {
+    notifyError(error instanceof Error ? error.message : '打开文件夹失败');
+    throw error;
+  }
+}
+
+export async function uploadChatAttachments(
+  sessionId: string,
+  files: globalThis.File[],
+): Promise<UploadedChatAttachment[]> {
+  const token = getToken();
+  const headers = new Headers();
+  if (token) {
+    headers.set('Authorization', `Bearer ${token}`);
+  }
+
+  const formData = new FormData();
+  for (const file of files) {
+    formData.append('files', file, file.name);
+  }
+
+  const search = new URLSearchParams();
+  if (sessionId) {
+    search.set('session', sessionId);
+  }
+  let response: Response;
+  try {
+    response = await fetch(`/api/chat/attachments${search.toString() ? `?${search.toString()}` : ''}`, {
+      method: 'POST',
+      headers,
+      body: formData,
+    });
+  } catch (err: unknown) {
+    const detail = err instanceof Error ? err.message : 'unknown network error';
+    throw new Error(`无法连接本地附件上传接口: ${detail}`);
+  }
+
+  if (response.status === 401) {
+    clearToken();
+    window.dispatchEvent(new Event('zeroclaw-unauthorized'));
+    throw new UnauthorizedError();
+  }
+  if (!response.ok) {
+    const text = await response.text().catch(() => '');
+    let detail = text || response.statusText;
+    try {
+      const parsed = JSON.parse(text) as { error?: string; message?: string };
+      detail = parsed.error || parsed.message || detail;
+    } catch {
+      // Fall back to raw response text when the server didn't return JSON.
+    }
+    throw new Error(`附件上传失败 (${response.status}): ${detail}`);
+  }
+
+  const data = (await response.json()) as { files: UploadedChatAttachment[] };
+  return data.files ?? [];
+}
+
+export function getChatWorkspace(sessionId: string): Promise<ChatWorkspaceResponse> {
+  const search = new URLSearchParams();
+  if (sessionId) {
+    search.set('session', sessionId);
+  }
+  return apiFetch<ChatWorkspaceResponse>(
+    `/api/chat/workspace${search.toString() ? `?${search.toString()}` : ''}`,
+  );
+}
+
+export function getChatWorkspacePreview(
+  sessionId: string,
+  relativePath: string,
+): Promise<ChatWorkspacePreview> {
+  const search = new URLSearchParams();
+  if (sessionId) {
+    search.set('session', sessionId);
+  }
+  search.set('path', relativePath);
+  return apiFetch<ChatWorkspacePreview>(`/api/chat/workspace/preview?${search.toString()}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -397,7 +538,7 @@ export interface OnboardInit {
   tool_mode?: 'sovereign' | 'composio';
   composio_api_key?: string;
   secrets_encrypt?: boolean;
-  autonomy_level?: 'read_only' | 'supervised' | 'full';
+  autonomy_level?: 'supervised' | 'full';
 
   // Hardware
   hardware_enabled?: boolean;

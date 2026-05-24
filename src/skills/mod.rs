@@ -13,11 +13,9 @@ mod audit;
 const OPEN_SKILLS_REPO_URL: &str = "https://github.com/besoeasy/open-skills";
 const OPEN_SKILLS_SYNC_MARKER: &str = ".zeroclaw-open-skills-sync";
 const OPEN_SKILLS_SYNC_INTERVAL_SECS: u64 = 60 * 60 * 24 * 7;
-const DEFAULT_SKILL_MARKET_URL: &str =
-    "https://raw.githubusercontent.com/besoeasy/open-skills/main/market/catalog.json";
-const DEFAULT_CLAWHUB_MARKET_API_URL: &str = "https://clawhub.ai/api/v1/skills";
+const DEFAULT_CLAWHUB_MARKET_API_URL: &str = "https://clawhub.ai/api/v1/packages";
 const DEFAULT_CLAWHUB_MARKET_API_FALLBACK_URL: &str =
-    "https://wry-manatee-359.convex.site/api/v1/skills";
+    "https://wry-manatee-359.convex.site/api/v1/packages";
 const DEFAULT_CLAWHUB_DOWNLOAD_API_URL: &str = "https://clawhub.ai/api/v1/download";
 const DEFAULT_CLAWHUB_DOWNLOAD_API_FALLBACK_URL: &str =
     "https://wry-manatee-359.convex.site/api/v1/download";
@@ -950,11 +948,14 @@ fn extract_clawhub_zip_secure(zip_bytes: &[u8], dest: &Path) -> Result<()> {
 }
 
 fn install_clawhub_skill_source(source: &str, skills_path: &Path) -> Result<(PathBuf, usize)> {
-    let slug = parse_clawhub_slug(source)
+    let full_slug = parse_clawhub_slug(source)
         .with_context(|| format!("invalid ClawHub source format: {source}"))?;
-    ensure_valid_skill_name(&slug)?;
 
-    let dest = skills_path.join(&slug);
+    // Extract the package name if the slug contains an owner handle (e.g., "owner/name")
+    let package_name = full_slug.split('/').last().unwrap_or(&full_slug);
+    ensure_valid_skill_name(package_name)?;
+
+    let dest = skills_path.join(package_name);
     if dest.exists() {
         anyhow::bail!("Destination skill already exists: {}", dest.display());
     }
@@ -979,7 +980,7 @@ fn install_clawhub_skill_source(source: &str, skills_path: &Path) -> Result<(Pat
     for download_url in download_urls {
         let response = match client
             .get(&download_url)
-            .query(&[("slug", slug.as_str()), ("tag", "latest")])
+            .query(&[("slug", package_name), ("tag", "latest")])
             .header(reqwest::header::USER_AGENT, DEFAULT_HTTP_USER_AGENT)
             .header(reqwest::header::ACCEPT, "application/zip")
             .send()
@@ -1034,7 +1035,7 @@ fn install_clawhub_skill_source(source: &str, skills_path: &Path) -> Result<(Pat
     let _ = std::fs::remove_dir_all(&dest);
     match last_error {
         Some(err) => Err(err),
-        None => anyhow::bail!("failed to download ClawHub skill: {slug}"),
+        None => anyhow::bail!("failed to download ClawHub skill: {full_slug}"),
     }
 }
 
@@ -1125,11 +1126,14 @@ struct ClawHubMarketResponse {
 
 #[derive(Debug, Clone, Deserialize)]
 struct ClawHubMarketItem {
-    slug: String,
+    name: String,
+    #[serde(rename = "ownerHandle")]
+    owner_handle: Option<String>,
     #[serde(rename = "displayName")]
     display_name: Option<String>,
     summary: Option<String>,
-    tags: Option<HashMap<String, String>>,
+    #[serde(rename = "capabilityTags")]
+    capability_tags: Option<Vec<String>>,
 }
 
 impl SkillAuditSummary {
@@ -1269,6 +1273,7 @@ fn fetch_clawhub_market_catalog() -> Option<Vec<SkillMarketItem>> {
             {
                 let mut qp = parsed.query_pairs_mut();
                 qp.append_pair("sort", "downloads");
+                qp.append_pair("family", "skill");
                 qp.append_pair("limit", &CLAWHUB_MARKET_PAGE_LIMIT.to_string());
                 if let Some(current_cursor) = &cursor {
                     qp.append_pair("cursor", current_cursor);
@@ -1292,25 +1297,30 @@ fn fetch_clawhub_market_catalog() -> Option<Vec<SkillMarketItem>> {
 
             let payload = response.json::<ClawHubMarketResponse>().ok()?;
             for item in payload.items {
-                let slug = item.slug.trim().to_string();
-                if slug.is_empty() || !seen_slug.insert(slug.clone()) {
+                let slug = if let Some(owner) = &item.owner_handle {
+                    format!("{}/{}", owner, item.name)
+                } else {
+                    item.name.clone()
+                };
+
+                if slug.trim().is_empty() || !seen_slug.insert(slug.clone()) {
                     continue;
                 }
                 let tags = item
-                    .tags
+                    .capability_tags
                     .unwrap_or_default()
                     .into_iter()
-                    .map(|(key, _)| key.trim().to_string())
+                    .map(|key| key.trim().to_string())
                     .filter(|value| !value.is_empty() && value != "latest")
                     .collect::<Vec<_>>();
                 all.push(SkillMarketItem {
                     id: format!("clawhub-{}", slug),
-                    name: item.display_name.unwrap_or_else(|| slug.clone()),
+                    name: item.display_name.unwrap_or_else(|| item.name.clone()),
                     description: item
                         .summary
                         .unwrap_or_else(|| "ClawHub community skill".to_string()),
                     source: format!("clawhub://{}", slug),
-                    publisher: "ClawHub".to_string(),
+                    publisher: item.owner_handle.unwrap_or_else(|| "ClawHub".to_string()),
                     tags,
                     risk_level: "high".to_string(),
                     verified: false,
@@ -1352,8 +1362,7 @@ fn fetch_clawhub_market_catalog() -> Option<Vec<SkillMarketItem>> {
 fn fetch_market_catalog() -> Option<Vec<SkillMarketItem>> {
     let url = std::env::var("ZEROCLAW_SKILL_MARKET_URL")
         .ok()
-        .filter(|v| !v.trim().is_empty())
-        .unwrap_or_else(|| DEFAULT_SKILL_MARKET_URL.to_string());
+        .filter(|v| !v.trim().is_empty())?;
 
     let response = reqwest::blocking::get(&url).ok()?;
     if !response.status().is_success() {

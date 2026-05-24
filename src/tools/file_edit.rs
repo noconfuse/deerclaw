@@ -76,16 +76,7 @@ impl Tool for FileEditTool {
             });
         }
 
-        // ── 2. Autonomy check ──────────────────────────────────────
-        if !self.security.can_act() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Action blocked: autonomy is read-only".into()),
-            });
-        }
-
-        // ── 3. Rate limit check ────────────────────────────────────
+        // ── 2. Rate limit check ────────────────────────────────────
         if self.security.is_rate_limited() {
             return Ok(ToolResult {
                 success: false,
@@ -94,7 +85,7 @@ impl Tool for FileEditTool {
             });
         }
 
-        // ── 4. Path pre-validation ─────────────────────────────────
+        // ── 3. Path pre-validation ─────────────────────────────────
         if !self.security.is_path_allowed(path) {
             return Ok(ToolResult {
                 success: false,
@@ -105,7 +96,7 @@ impl Tool for FileEditTool {
 
         let full_path = self.security.workspace_dir.join(path);
 
-        // ── 5. Canonicalize parent ─────────────────────────────────
+        // ── 4. Canonicalize parent ─────────────────────────────────
         let Some(parent) = full_path.parent() else {
             return Ok(ToolResult {
                 success: false,
@@ -125,7 +116,7 @@ impl Tool for FileEditTool {
             }
         };
 
-        // ── 6. Resolved path post-validation ───────────────────────
+        // ── 5. Resolved path post-validation ───────────────────────
         if !self.security.is_resolved_path_allowed(&resolved_parent) {
             return Ok(ToolResult {
                 success: false,
@@ -147,7 +138,7 @@ impl Tool for FileEditTool {
 
         let resolved_target = resolved_parent.join(file_name);
 
-        // ── 7. Symlink check ───────────────────────────────────────
+        // ── 6. Symlink check ───────────────────────────────────────
         if let Ok(meta) = tokio::fs::symlink_metadata(&resolved_target).await {
             if meta.file_type().is_symlink() {
                 return Ok(ToolResult {
@@ -161,7 +152,7 @@ impl Tool for FileEditTool {
             }
         }
 
-        // ── 8. Record action ───────────────────────────────────────
+        // ── 7. Record action ───────────────────────────────────────
         if !self.security.record_action() {
             return Ok(ToolResult {
                 success: false,
@@ -170,7 +161,7 @@ impl Tool for FileEditTool {
             });
         }
 
-        // ── 9. Read → match → replace → write ─────────────────────
+        // ── 8. Read → match → replace → write ─────────────────────
         let content = match tokio::fs::read_to_string(&resolved_target).await {
             Ok(c) => c,
             Err(e) => {
@@ -238,12 +229,10 @@ mod tests {
     fn test_security_with(
         workspace: std::path::PathBuf,
         autonomy: AutonomyLevel,
-        max_actions_per_hour: u32,
     ) -> Arc<SecurityPolicy> {
         Arc::new(SecurityPolicy {
             autonomy,
             workspace_dir: workspace,
-            max_actions_per_hour,
             ..SecurityPolicy::default()
         })
     }
@@ -570,36 +559,6 @@ mod tests {
         assert_eq!(content, "original", "original file must not be modified");
 
         let _ = tokio::fs::remove_dir_all(&root).await;
-    }
-
-    #[tokio::test]
-    async fn file_edit_blocks_readonly_mode() {
-        let dir = std::env::temp_dir().join("zeroclaw_test_file_edit_readonly");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        tokio::fs::create_dir_all(&dir).await.unwrap();
-        tokio::fs::write(dir.join("test.txt"), "hello")
-            .await
-            .unwrap();
-
-        let tool = FileEditTool::new(test_security_with(dir.clone(), AutonomyLevel::ReadOnly, 20));
-        let result = tool
-            .execute(json!({
-                "path": "test.txt",
-                "old_string": "hello",
-                "new_string": "world"
-            }))
-            .await
-            .unwrap();
-
-        assert!(!result.success);
-        assert!(result.error.as_deref().unwrap_or("").contains("read-only"));
-
-        let content = tokio::fs::read_to_string(dir.join("test.txt"))
-            .await
-            .unwrap();
-        assert_eq!(content, "hello");
-
-        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     #[tokio::test]

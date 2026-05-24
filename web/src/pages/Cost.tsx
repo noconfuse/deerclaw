@@ -8,6 +8,7 @@ import {
 import { useTranslation } from 'react-i18next';
 import type { CostSummary } from '@/types/api';
 import { getCost } from '@/lib/api';
+import { useNotify } from '@/hooks/useNotify';
 
 function formatUSD(value: number): string {
   return `$${value.toFixed(4)}`;
@@ -15,6 +16,7 @@ function formatUSD(value: number): string {
 
 export default function Cost() {
   const { t } = useTranslation();
+  const notify = useNotify();
   const [cost, setCost] = useState<CostSummary | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -22,9 +24,13 @@ export default function Cost() {
   useEffect(() => {
     getCost()
       .then(setCost)
-      .catch((err) => setError(err.message))
+      .catch((err) => {
+        const message = err instanceof Error ? err.message : t('cost.load_failed');
+        setError(message);
+        notify.error(message, { key: 'cost:load' });
+      })
       .finally(() => setLoading(false));
-  }, []);
+  }, [notify, t]);
 
   if (error) {
     return (

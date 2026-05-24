@@ -3,8 +3,7 @@
     "beforeDevCommand": "",
     "beforeBuildCommand": "",
     "devPath": "../../web/dist",
-    "distDir": "../../web/dist",
-    "withGlobalTauri": false
+    "distDir": "../../web/dist"
   },
   "package": {
     "productName": "DeerClaw",
@@ -40,7 +39,9 @@
         "providerShortName": null,
         "signingIdentity": null
       },
-      "resources": [],
+      "resources": [
+        "resources/officecli"
+      ],
       "shortDescription": "",
       "targets": "all",
       "windows": {

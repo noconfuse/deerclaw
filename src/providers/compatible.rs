@@ -6,8 +6,8 @@ use crate::cost::tracker::CostTracker;
 use crate::multimodal;
 use crate::providers::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
-    Provider, StreamChunk, StreamError, StreamOptions, StreamResult, TokenUsage,
-    ToolCall as ProviderToolCall,
+    Provider, StreamChunk, StreamError, StreamOptions, StreamResult, StreamToolCallDelta,
+    TokenUsage, ToolCall as ProviderToolCall,
 };
 use async_trait::async_trait;
 use futures_util::{stream, StreamExt};
@@ -529,9 +529,9 @@ struct NativeMessage {
     tool_call_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<ToolCall>>,
-    /// Raw reasoning content from thinking models; pass-through for providers
-    /// that require it in assistant tool-call history messages.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Keep locally for parsed history compatibility, but never send it back to
+    /// OpenAI-compatible providers because many endpoints reject unknown fields.
+    #[serde(skip_serializing)]
     reasoning_content: Option<String>,
 }
 
@@ -595,16 +595,36 @@ struct StreamDelta {
     /// Reasoning/thinking models may stream output via `reasoning_content`.
     #[serde(default)]
     reasoning_content: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Vec<StreamToolCall>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StreamToolCall {
+    #[serde(default)]
+    index: Option<usize>,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    function: Option<StreamToolFunction>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StreamToolFunction {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
 }
 
 /// Parse SSE (Server-Sent Events) stream from OpenAI-compatible providers.
 /// Handles the `data: {...}` format and `[DONE]` sentinel.
-fn parse_sse_line(line: &str) -> StreamResult<Option<String>> {
+fn parse_sse_line(line: &str) -> StreamResult<Vec<StreamChunk>> {
     let line = line.trim();
 
     // Skip empty lines and comments
     if line.is_empty() || line.starts_with(':') {
-        return Ok(None);
+        return Ok(Vec::new());
     }
 
     // SSE format: "data: {...}"
@@ -613,27 +633,46 @@ fn parse_sse_line(line: &str) -> StreamResult<Option<String>> {
 
         // Check for [DONE] sentinel
         if data == "[DONE]" {
-            return Ok(None);
+            return Ok(Vec::new());
         }
 
         // Parse JSON delta
         let chunk: StreamChunkResponse = serde_json::from_str(data).map_err(StreamError::Json)?;
+        let mut output = Vec::new();
 
-        // Extract content from delta
         if let Some(choice) = chunk.choices.first() {
             if let Some(content) = &choice.delta.content {
                 if !content.is_empty() {
-                    return Ok(Some(content.clone()));
+                    output.push(StreamChunk::delta(content.clone()));
                 }
             }
-            // Fallback to reasoning_content for thinking models
             if let Some(reasoning) = &choice.delta.reasoning_content {
-                return Ok(Some(reasoning.clone()));
+                if !reasoning.is_empty() {
+                    output.push(StreamChunk::reasoning_delta(reasoning.clone()));
+                }
+            }
+            if let Some(tool_calls) = &choice.delta.tool_calls {
+                for tool_call in tool_calls {
+                    let function = tool_call.function.as_ref();
+                    output.push(StreamChunk::tool_call_delta(StreamToolCallDelta {
+                        index: tool_call.index.unwrap_or(0),
+                        id: tool_call.id.clone(),
+                        name: function.and_then(|function| function.name.clone()),
+                        arguments_delta: function.and_then(|function| function.arguments.clone()),
+                    }));
+                }
             }
         }
+
+        return Ok(output);
     }
 
-    Ok(None)
+    Ok(Vec::new())
+}
+
+fn take_next_sse_line(buffer: &mut String) -> Option<String> {
+    let pos = buffer.find('\n')?;
+    Some(buffer.drain(..=pos).collect())
 }
 
 /// Convert SSE byte stream to text chunks.
@@ -679,21 +718,18 @@ fn sse_bytes_to_chunks(
                     buffer.push_str(&text);
 
                     // Process complete lines
-                    while let Some(pos) = buffer.find('\n') {
-                        let line = buffer.drain(..=pos).collect::<String>();
-                        buffer = buffer[pos + 1..].to_string();
-
+                    while let Some(line) = take_next_sse_line(&mut buffer) {
                         match parse_sse_line(&line) {
-                            Ok(Some(content)) => {
-                                let mut chunk = StreamChunk::delta(content);
-                                if count_tokens {
-                                    chunk = chunk.with_token_estimate();
-                                }
-                                if tx.send(Ok(chunk)).await.is_err() {
-                                    return; // Receiver dropped
+                            Ok(chunks) => {
+                                for mut chunk in chunks {
+                                    if count_tokens && !chunk.delta.is_empty() {
+                                        chunk = chunk.with_token_estimate();
+                                    }
+                                    if tx.send(Ok(chunk)).await.is_err() {
+                                        return; // Receiver dropped
+                                    }
                                 }
                             }
-                            Ok(None) => {}
                             Err(e) => {
                                 let _ = tx.send(Err(e)).await;
                                 return;
@@ -960,17 +996,12 @@ impl OpenAiCompatibleProvider {
                                     .and_then(serde_json::Value::as_str)
                                     .map(|value| MessageContent::Text(value.to_string()));
 
-                                let reasoning_content = value
-                                    .get("reasoning_content")
-                                    .and_then(serde_json::Value::as_str)
-                                    .map(ToString::to_string);
-
                                 return NativeMessage {
                                     role: "assistant".to_string(),
                                     content,
                                     tool_call_id: None,
                                     tool_calls: Some(tool_calls),
-                                    reasoning_content,
+                                    reasoning_content: None,
                                 };
                             }
                         }
@@ -1051,17 +1082,15 @@ impl OpenAiCompatibleProvider {
             .filter_map(|tc| {
                 let name = tc.function_name()?;
                 let arguments = tc.function_arguments().unwrap_or_else(|| "{}".to_string());
-                let normalized_arguments =
-                    if serde_json::from_str::<serde_json::Value>(&arguments).is_ok() {
-                        arguments
-                    } else {
+                let normalized_arguments = Self::normalize_native_tool_call_arguments(&arguments)
+                    .unwrap_or_else(|| {
                         tracing::warn!(
                             function = %name,
                             arguments = %arguments,
                             "Invalid JSON in native tool-call arguments, using empty object"
                         );
                         "{}".to_string()
-                    };
+                    });
                 Some(ProviderToolCall {
                     id: tc.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
                     name,
@@ -1076,6 +1105,35 @@ impl OpenAiCompatibleProvider {
             usage: None,
             reasoning_content,
         }
+    }
+
+    fn normalize_native_tool_call_arguments(arguments: &str) -> Option<String> {
+        if serde_json::from_str::<serde_json::Value>(arguments).is_ok() {
+            return Some(arguments.to_string());
+        }
+
+        let stripped = arguments
+            .replace("</tool_call>", "")
+            .replace("<tool_call>", "")
+            .trim()
+            .to_string();
+
+        if serde_json::from_str::<serde_json::Value>(&stripped).is_ok() {
+            return Some(stripped);
+        }
+
+        let start = stripped.find('{')?;
+        let end = stripped.rfind('}')?;
+        if end < start {
+            return None;
+        }
+
+        let candidate = stripped[start..=end].trim();
+        if serde_json::from_str::<serde_json::Value>(candidate).is_ok() {
+            return Some(candidate.to_string());
+        }
+
+        None
     }
 
     fn is_native_tool_schema_unsupported(status: reqwest::StatusCode, error: &str) -> bool {
@@ -1641,6 +1699,96 @@ impl Provider for OpenAiCompatibleProvider {
         true
     }
 
+    fn stream_chat(
+        &self,
+        request: ProviderChatRequest<'_>,
+        model: &str,
+        temperature: f64,
+        options: StreamOptions,
+    ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+        let credential = match self.credential.as_ref() {
+            Some(value) => value.clone(),
+            None => {
+                let provider_name = self.name.clone();
+                return stream::once(async move {
+                    Err(StreamError::Provider(format!(
+                        "{} API key not set",
+                        provider_name
+                    )))
+                })
+                .boxed();
+            }
+        };
+
+        let effective_messages = if self.merge_system_into_user {
+            Self::flatten_system_messages(request.messages)
+        } else {
+            request.messages.to_vec()
+        };
+        let tools = Self::convert_tool_specs(request.tools);
+        let native_request = NativeChatRequest {
+            model: model.to_string(),
+            messages: Self::convert_messages_for_native(
+                &effective_messages,
+                !self.merge_system_into_user,
+            ),
+            temperature,
+            stream: Some(options.enabled),
+            tool_choice: tools.as_ref().map(|_| "auto".to_string()),
+            tools,
+        };
+
+        let url = self.chat_completions_url();
+        let client = self.http_client();
+        let auth_header = self.auth_header.clone();
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(100);
+
+        tokio::spawn(async move {
+            let mut req_builder = client.post(&url).json(&native_request);
+            req_builder = match &auth_header {
+                AuthStyle::Bearer => {
+                    req_builder.header("Authorization", format!("Bearer {}", credential))
+                }
+                AuthStyle::XApiKey => req_builder.header("x-api-key", &credential),
+                AuthStyle::Custom(header) => req_builder.header(header, &credential),
+            };
+            req_builder = req_builder.header("Accept", "text/event-stream");
+
+            let response = match req_builder.send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = tx.send(Err(StreamError::Http(e))).await;
+                    return;
+                }
+            };
+
+            if !response.status().is_success() {
+                let status = response.status();
+                let error = match response.text().await {
+                    Ok(e) => e,
+                    Err(_) => format!("HTTP error: {}", status),
+                };
+                let _ = tx
+                    .send(Err(StreamError::Provider(format!("{}: {}", status, error))))
+                    .await;
+                return;
+            }
+
+            let mut chunk_stream = sse_bytes_to_chunks(response, options.count_tokens);
+            while let Some(chunk) = chunk_stream.next().await {
+                if tx.send(chunk).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|chunk| (chunk, rx))
+        })
+        .boxed()
+    }
+
     fn stream_chat_with_system(
         &self,
         system_prompt: Option<&str>,
@@ -2030,6 +2178,22 @@ mod tests {
             call.function_arguments().as_deref(),
             Some("{\"query\":\"preferred\"}")
         );
+    }
+
+    #[test]
+    fn normalize_native_tool_call_arguments_strips_tool_call_tags() {
+        let raw = r#"{"action":"screenshot</tool_call>"}"#;
+        let normalized = OpenAiCompatibleProvider::normalize_native_tool_call_arguments(raw)
+            .expect("arguments should be recovered");
+        assert_eq!(normalized, r#"{"action":"screenshot"}"#);
+    }
+
+    #[test]
+    fn normalize_native_tool_call_arguments_extracts_json_object_from_wrapped_text() {
+        let raw = r#"noise <tool_call> {"action":"snapshot"} trailing"#;
+        let normalized = OpenAiCompatibleProvider::normalize_native_tool_call_arguments(raw)
+            .expect("arguments should be recovered");
+        assert_eq!(normalized, r#"{"action":"snapshot"}"#);
     }
 
     // ----------------------------------------------------------
@@ -2784,36 +2948,68 @@ mod tests {
     fn parse_sse_line_with_content() {
         let line = r#"data: {"choices":[{"delta":{"content":"hello"}}]}"#;
         let result = parse_sse_line(line).unwrap();
-        assert_eq!(result, Some("hello".to_string()));
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].delta, "hello");
+        assert!(result[0].reasoning_delta.is_none());
     }
 
     #[test]
     fn parse_sse_line_with_reasoning_content() {
         let line = r#"data: {"choices":[{"delta":{"reasoning_content":"thinking..."}}]}"#;
         let result = parse_sse_line(line).unwrap();
-        assert_eq!(result, Some("thinking...".to_string()));
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].reasoning_delta.as_deref(), Some("thinking..."));
+        assert!(result[0].delta.is_empty());
     }
 
     #[test]
-    fn parse_sse_line_with_both_prefers_content() {
+    fn parse_sse_line_with_both_emits_both_chunks() {
         let line = r#"data: {"choices":[{"delta":{"content":"real answer","reasoning_content":"thinking..."}}]}"#;
         let result = parse_sse_line(line).unwrap();
-        assert_eq!(result, Some("real answer".to_string()));
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].delta, "real answer");
+        assert_eq!(result[1].reasoning_delta.as_deref(), Some("thinking..."));
     }
 
     #[test]
-    fn parse_sse_line_with_empty_content_falls_back_to_reasoning_content() {
+    fn parse_sse_line_with_empty_content_emits_reasoning_only() {
         let line =
             r#"data: {"choices":[{"delta":{"content":"","reasoning_content":"thinking..."}}]}"#;
         let result = parse_sse_line(line).unwrap();
-        assert_eq!(result, Some("thinking...".to_string()));
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].reasoning_delta.as_deref(), Some("thinking..."));
     }
 
     #[test]
     fn parse_sse_line_done_sentinel() {
         let line = "data: [DONE]";
         let result = parse_sse_line(line).unwrap();
-        assert_eq!(result, None);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn parse_sse_line_with_tool_call_delta() {
+        let line = r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"browser","arguments":"{\"action\":\"open\"}"}}]}}]}"#;
+        let result = parse_sse_line(line).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].tool_call_deltas.len(), 1);
+        let tool_delta = &result[0].tool_call_deltas[0];
+        assert_eq!(tool_delta.index, 0);
+        assert_eq!(tool_delta.id.as_deref(), Some("call_1"));
+        assert_eq!(tool_delta.name.as_deref(), Some("browser"));
+        assert_eq!(
+            tool_delta.arguments_delta.as_deref(),
+            Some(r#"{"action":"open"}"#)
+        );
+    }
+
+    #[test]
+    fn take_next_sse_line_handles_multibyte_content_without_panicking() {
+        let mut buffer =
+            "data: {\"choices\":[{\"delta\":{\"content\":\"你好\"}}]}\n剩余".to_string();
+        let line = take_next_sse_line(&mut buffer).unwrap();
+        assert_eq!(line, "data: {\"choices\":[{\"delta\":{\"content\":\"你好\"}}]}\n");
+        assert_eq!(buffer, "剩余");
     }
 
     #[test]
@@ -2877,8 +3073,7 @@ mod tests {
     }
 
     #[test]
-    fn convert_messages_for_native_round_trips_reasoning_content() {
-        // Simulate stored assistant history JSON that includes reasoning_content
+    fn convert_messages_for_native_ignores_reasoning_content_in_history() {
         let history_json = serde_json::json!({
             "content": "I will check",
             "tool_calls": [{
@@ -2893,10 +3088,7 @@ mod tests {
         let native = OpenAiCompatibleProvider::convert_messages_for_native(&messages, true);
         assert_eq!(native.len(), 1);
         assert_eq!(native[0].role, "assistant");
-        assert_eq!(
-            native[0].reasoning_content.as_deref(),
-            Some("Let me think about this...")
-        );
+        assert!(native[0].reasoning_content.is_none());
         assert!(native[0].tool_calls.is_some());
     }
 
@@ -2919,8 +3111,7 @@ mod tests {
     }
 
     #[test]
-    fn convert_messages_for_native_reasoning_content_serialized_only_when_present() {
-        // Verify skip_serializing_if works: reasoning_content omitted from JSON when None
+    fn convert_messages_for_native_never_serializes_reasoning_content() {
         let msg_without = NativeMessage {
             role: "assistant".to_string(),
             content: Some(MessageContent::Text("hi".to_string())),
@@ -2943,9 +3134,8 @@ mod tests {
         };
         let json = serde_json::to_string(&msg_with).unwrap();
         assert!(
-            json.contains("reasoning_content"),
-            "reasoning_content should be present when Some"
+            !json.contains("reasoning_content"),
+            "reasoning_content should never be sent back in outbound history"
         );
-        assert!(json.contains("thinking..."));
     }
 }
